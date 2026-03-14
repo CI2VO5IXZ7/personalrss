@@ -82,6 +82,9 @@ app.get('/rss/ig/:username', async c => {
   const { username } = c.req.param();
   const accounts = getAccounts(c.env);
   const account = (accounts.instagram || []).find(a => a.username.toLowerCase() === username.toLowerCase());
+  if (!account) {
+    return c.json({ error: 'Account not configured' }, 404);
+  }
   const displayName = account?.displayName || username;
   const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
@@ -109,6 +112,9 @@ app.get('/rss/xhs/:userId', async c => {
   const { userId } = c.req.param();
   const accounts = getAccounts(c.env);
   const account = (accounts.xiaohongshu || []).find(a => a.userId === userId);
+  if (!account) {
+    return c.json({ error: 'Account not configured' }, 404);
+  }
   const displayName = account?.displayName || userId;
   const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
