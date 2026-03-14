@@ -6,7 +6,7 @@ const XHS_BASE = 'https://www.xiaohongshu.com';
 
 // ─── CF Browser Rendering scrape ─────────────────────────────────────────────
 
-async function cfScrape(env, url, elements, cookies = []) {
+export async function cfScrape(env, url, elements, cookies = []) {
   const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/browser-rendering/scrape`;
   const resp = await fetch(cfUrl, {
     method: 'POST',

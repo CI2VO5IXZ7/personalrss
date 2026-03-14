@@ -30,14 +30,22 @@ function rssResponse(xml) {
 // 合并去重：新数据 + 旧缓存，按时间排序，保留最新 50 条
 function mergePosts(newPosts, cachedPosts) {
   const map = new Map();
+  const seenLinks = new Set();
+
+  function addPost(p) {
+    if (!p) return;
+    // 优先按 id 去重，再按 link 去重（防止 CDN URL 变化导致 id 不同但实际是同一帖子）
+    if (p.id && map.has(p.id)) { map.set(p.id, p); return; }
+    if (p.link && seenLinks.has(p.link)) return;
+    if (p.id) map.set(p.id, p);
+    if (p.link) seenLinks.add(p.link);
+  }
+
   // 旧数据先放入
-  for (const p of (cachedPosts || [])) {
-    if (p.id) map.set(p.id, p);
-  }
+  for (const p of (cachedPosts || [])) addPost(p);
   // 新数据覆盖
-  for (const p of (newPosts || [])) {
-    if (p.id) map.set(p.id, p);
-  }
+  for (const p of (newPosts || [])) addPost(p);
+
   return [...map.values()]
     .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
     .slice(0, 50);
