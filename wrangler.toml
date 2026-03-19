@@ -2,10 +2,6 @@ name = "social-rss-bridge"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
-# 构建前安装依赖（Cloudflare 自动构建需要）
-[build]
-command = "npm install"
-
 # 智能部署 — 自动选择最优地域
 [placement]
 mode = "smart"
