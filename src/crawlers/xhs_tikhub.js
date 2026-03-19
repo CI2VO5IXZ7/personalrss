@@ -125,8 +125,8 @@ function extractNoteFromDetail(apiData, endpoint) {
   }
 
   if (endpoint === 'get_video_note_detail') {
-    // 结构: data.data = [ noteObj, ... ] (直接就是笔记)
-    if (Array.isArray(inner) && inner[0]?.note_id) {
+    // 结构: data.data = [ noteObj, ... ] (直接就是笔记，字段用 id 而非 note_id)
+    if (Array.isArray(inner) && inner[0]?.id) {
       return inner[0];
     }
   }
