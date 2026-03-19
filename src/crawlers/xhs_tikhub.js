@@ -6,6 +6,8 @@
 //   get_image_note_detail  → data.data[0].note_list[0]  含 { note_id, title, desc, time, image_list[].url }
 //   get_video_note_detail  → data.data[0]  直接是笔记对象 { note_id, title, desc, time, images_list[].url, video_info_v2 }
 
+import { trackApiCall } from '../db.js';
+
 const TIKHUB_BASE = 'https://api.tikhub.io';
 const XHS_BASE = 'https://www.xiaohongshu.com';
 
@@ -25,6 +27,7 @@ export async function fetchProfile(env, userId) {
       'Accept': 'application/json'
     }
   });
+  if (env.DB) await trackApiCall(env.DB, 'get_user_posted_notes').catch(() => {});
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
@@ -40,7 +43,39 @@ export async function fetchProfile(env, userId) {
   const notes = data.data?.data?.notes || data.data?.notes || [];
   if (!notes.length) return [];
 
-  return notes.map(note => parseNoteFromList(note, userId)).filter(Boolean);
+  const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+  const results = [];
+
+  for (const note of notes) {
+    const noteId = note.id || note.note_id || '';
+    const noteType = note.type || 'normal';
+    // 根据列表中的 type 直接调用对应的详情接口
+    const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
+
+    try {
+      const detailUrl = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
+      const detailResp = await fetch(detailUrl, { headers });
+      if (env.DB) await trackApiCall(env.DB, endpoint).catch(() => {});
+      if (detailResp.ok) {
+        const detailData = await detailResp.json();
+        if (detailData.code === 200 && detailData.data) {
+          const noteObj = extractNoteFromDetail(detailData.data, endpoint);
+          if (noteObj) {
+            const parsed = parseNote(noteObj, noteType);
+            if (parsed) { results.push(parsed); continue; }
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[xhs] ${endpoint} for ${noteId} error: ${e.message}`);
+    }
+
+    // 详情接口失败时回退到列表数据
+    const parsed = parseNoteFromList(note, userId);
+    if (parsed) results.push(parsed);
+  }
+
+  return results;
 }
 
 // ─── 获取单条笔记详情（含完整图文）─────────────────────────────────────────
@@ -51,25 +86,20 @@ export async function fetchNoteDetail(env, noteId, noteType) {
 
   const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
 
-  // 根据类型决定端点顺序; normal=图文优先, video=视频优先
-  const endpoints = noteType === 'video'
-    ? ['get_video_note_detail', 'get_image_note_detail']
-    : ['get_image_note_detail', 'get_video_note_detail'];
+  // 根据类型直接调用对应的详情接口
+  const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
 
-  for (const endpoint of endpoints) {
-    try {
-      const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
-      const resp = await fetch(url, { headers });
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      if (data.code !== 200 || !data.data) continue;
+  try {
+    const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
+    const resp = await fetch(url, { headers });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (data.code !== 200 || !data.data) return null;
 
-      // 提取笔记对象 — 两个接口返回结构不同
-      const noteObj = extractNoteFromDetail(data.data, endpoint);
-      if (noteObj) return parseNote(noteObj);
-    } catch (e) {
-      console.error(`[xhs] ${endpoint} error: ${e.message}`);
-    }
+    const noteObj = extractNoteFromDetail(data.data, endpoint);
+    if (noteObj) return parseNote(noteObj, noteType);
+  } catch (e) {
+    console.error(`[xhs] ${endpoint} error: ${e.message}`);
   }
   return null;
 }
@@ -136,7 +166,7 @@ function parseNoteFromList(note, userId) {
 
 // ─── 解析笔记对象 (来自详情接口) ────────────────────────────────────────────
 
-function parseNote(noteObj) {
+function parseNote(noteObj, noteType) {
   try {
     const noteId = noteObj.note_id || noteObj.id || '';
     const title = noteObj.title || '';
@@ -144,13 +174,14 @@ function parseNote(noteObj) {
 
     const imageList = extractImageUrls(noteObj);
     const cover = imageList[0] || '';
+    const videoUrl = noteType === 'video' ? extractVideoUrl(noteObj) : '';
 
     const date = parseTimestamp(noteObj.time || noteObj.create_time || noteObj.last_update_time)
                || parseObjectIdDate(noteId)
                || new Date().toISOString();
 
     const link = `${XHS_BASE}/explore/${noteId}`;
-    const description = buildDescription(desc, imageList, cover);
+    const description = buildDescription(desc, imageList, cover, videoUrl);
 
     return {
       id: noteId,
@@ -189,12 +220,47 @@ function extractImageUrls(noteData) {
   for (const list of lists) {
     if (!Array.isArray(list)) continue;
     for (const img of list) {
-      addUrl(img.url || img.url_default || img.original);
+      addUrl(convertHeifToJpg(img.url || img.url_default || img.original));
     }
     if (urls.length > 0) break;
   }
 
   return urls;
+}
+
+// ─── HEIF → JPG 转换（XHS CDN 支持 URL 参数转格式）─────────────────────────
+
+function convertHeifToJpg(url) {
+  if (!url || typeof url !== 'string') return url;
+  // XHS CDN URL 含 format/heif 或 format/hei，替换为 format/jpg
+  return url.replace(/format\/heif?\b/gi, 'format/jpg');
+}
+
+// ─── 提取视频 URL ────────────────────────────────────────────────────────
+
+function extractVideoUrl(noteObj) {
+  const v2 = noteObj.video_info_v2 || noteObj.video_info || noteObj.video;
+  if (!v2) return '';
+  if (typeof v2 === 'string') return v2;
+  if (v2.url) return v2.url;
+
+  // media.stream.h264[0].master_url / h265 / av1
+  const stream = v2.media?.stream;
+  if (stream) {
+    for (const codec of ['h264', 'h265', 'av1']) {
+      const tracks = stream[codec];
+      if (Array.isArray(tracks) && tracks[0]?.master_url) {
+        return tracks[0].master_url;
+      }
+    }
+  }
+
+  // url_info_list
+  if (Array.isArray(v2.url_info_list) && v2.url_info_list[0]?.url) {
+    return v2.url_info_list[0].url;
+  }
+
+  return '';
 }
 
 // ─── 时间戳解析 ────────────────────────────────────────────────────────────
@@ -218,12 +284,18 @@ function parseObjectIdDate(noteId) {
 
 // ─── 构建 HTML 描述（含图文）───────────────────────────────────────────────
 
-function buildDescription(desc, imageList, fallbackCover) {
+function buildDescription(desc, imageList, fallbackCover, videoUrl) {
   let html = '';
 
-  const images = imageList.length > 0 ? imageList : (fallbackCover ? [fallbackCover] : []);
-  for (const imgUrl of images) {
-    html += `<p><img src="${imgUrl}" style="max-width:100%"/></p>`;
+  if (videoUrl) {
+    // 视频笔记: 使用 video 标签，封面作为 poster
+    html += `<p><video src="${videoUrl}" controls style="max-width:100%"${fallbackCover ? ` poster="${fallbackCover}"` : ''}>视频无法播放</video></p>`;
+  } else {
+    // 图文笔记: 展示所有图片
+    const images = imageList.length > 0 ? imageList : (fallbackCover ? [fallbackCover] : []);
+    for (const imgUrl of images) {
+      html += `<p><img src="${imgUrl}" style="max-width:100%"/></p>`;
+    }
   }
 
   if (desc) {

@@ -113,6 +113,44 @@ export async function setSetting(db, key, value) {
   } catch (e) { console.error('[db] setSetting error:', e.message); }
 }
 
+// ─── API Usage Tracking ─────────────────────────────────────────────────────
+
+export async function trackApiCall(db, endpoint) {
+  try {
+    // 使用北京时间日期
+    const now = new Date(Date.now() + 8 * 3600 * 1000);
+    const date = now.toISOString().slice(0, 10);
+    await db.prepare(
+      `INSERT INTO api_usage (date, endpoint, calls) VALUES (?, ?, 1)
+       ON CONFLICT(date, endpoint) DO UPDATE SET calls = calls + 1`
+    ).bind(date, endpoint).run();
+  } catch (e) {
+    console.error('[db] trackApiCall error:', e.message);
+  }
+}
+
+export async function getApiUsage(db, days = 7) {
+  try {
+    const now = new Date(Date.now() + 8 * 3600 * 1000);
+    const since = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+    const { results } = await db.prepare(
+      `SELECT date, endpoint, calls FROM api_usage WHERE date >= ? ORDER BY date DESC, endpoint`
+    ).bind(since).all();
+    return results || [];
+  } catch { return []; }
+}
+
+export async function getApiUsageSummary(db, days = 7) {
+  try {
+    const now = new Date(Date.now() + 8 * 3600 * 1000);
+    const since = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
+    const { results } = await db.prepare(
+      `SELECT date, SUM(calls) as total_calls FROM api_usage WHERE date >= ? GROUP BY date ORDER BY date DESC`
+    ).bind(since).all();
+    return results || [];
+  } catch { return []; }
+}
+
 // ─── Helper: convert cached rows to RSS post objects ─────────────────────────
 
 export function rowToPost(row) {
