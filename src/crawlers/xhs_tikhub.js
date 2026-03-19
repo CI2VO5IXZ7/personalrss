@@ -11,7 +11,7 @@ export async function fetchProfile(env, userId) {
     throw Object.assign(new Error('[xhs] TIKHUB_API_TOKEN not configured'), { code: 'NO_API_TOKEN' });
   }
 
-  const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/fetch_user_posted_notes?user_id=${encodeURIComponent(userId)}&cursor=&count=20`;
+  const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/get_user_posted_notes?user_id=${encodeURIComponent(userId)}&cursor=`;
 
   const resp = await fetch(url, {
     headers: {
@@ -50,26 +50,22 @@ export async function fetchNoteDetail(env, noteId) {
   const token = env.TIKHUB_API_TOKEN;
   if (!token) return null;
 
-  const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/fetch_note_info?note_id=${encodeURIComponent(noteId)}`;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
 
-  try {
-    const resp = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      }
-    });
-
-    if (!resp.ok) return null;
-
-    const data = await resp.json();
-    if (data.code !== 200) return null;
-
-    return parseNoteDetail(data.data);
-  } catch (e) {
-    console.error(`[xhs] fetchNoteDetail error: ${e.message}`);
-    return null;
+  // 先尝试图文详情，失败再尝试视频详情
+  for (const endpoint of ['get_image_note_detail', 'get_video_note_detail']) {
+    try {
+      const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      if (data.code !== 200 || !data.data) continue;
+      return parseNoteDetail(data.data);
+    } catch (e) {
+      console.error(`[xhs] ${endpoint} error: ${e.message}`);
+    }
   }
+  return null;
 }
 
 // ─── 解析笔记列表项 ────────────────────────────────────────────────────────
