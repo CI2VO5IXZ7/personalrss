@@ -25,9 +25,9 @@ export async function getAccount(db, platform, userId) {
 
 export async function addAccount(db, platform, userId, displayName = '') {
   try {
-    await db.prepare('INSERT OR IGNORE INTO accounts (platform, user_id, display_name) VALUES (?, ?, ?)')
+    const result = await db.prepare('INSERT OR IGNORE INTO accounts (platform, user_id, display_name) VALUES (?, ?, ?)')
       .bind(platform, userId, displayName).run();
-    return true;
+    return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] addAccount error:', e.message);
     return false;

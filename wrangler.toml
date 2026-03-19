@@ -6,7 +6,7 @@ compatibility_date = "2025-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "social-rss-bridge-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
 # Cron Triggers — 每小时刷新缓存

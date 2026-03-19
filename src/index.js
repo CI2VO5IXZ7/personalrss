@@ -5,7 +5,7 @@ import {
   getCachedPosts, upsertPosts, isCacheStale, rowToPost
 } from './db.js';
 import { generateInstagramFeed, generateXhsFeed } from './rss.js';
-import { sendMessage, setWebhook, parseCommand } from './telegram.js';
+import { sendMessage, setWebhook, parseCommand, verifyWebhookSecret } from './telegram.js';
 import { handleImageProxy } from './proxy.js';
 import { fetchProfile as fetchIg } from './crawlers/instagram.js';
 import { fetchProfile as fetchXhs } from './crawlers/xhs_tikhub.js';
@@ -139,7 +139,8 @@ app.get('/setup-webhook', async c => {
     return c.json({ error: 'Unauthorized' }, 401);
   }
   const baseUrl = getBaseUrl(c.env, c.req.raw);
-  const result = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`);
+  const secretToken = c.env.ADMIN_TOKEN || '';
+  const result = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
   return c.json(result);
 });
 
@@ -156,6 +157,11 @@ app.get('/admin/refresh', async c => {
 // ─── Telegram Webhook ─────────────────────────────────────────────────────────
 
 app.post('/telegram', async c => {
+  // 校验 Telegram Webhook Secret Token
+  if (!verifyWebhookSecret(c.req.raw, c.env.ADMIN_TOKEN || '')) {
+    return c.text('ok');
+  }
+
   let update;
   try { update = await c.req.json(); } catch { return c.text('ok'); }
 
@@ -249,7 +255,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
     case 'list': {
       const accounts = await getAccounts(db);
       if (accounts.length === 0) {
-        await sendMessage(token, chatId, '� 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+        await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
         break;
       }
       let msg = '📋 <b>订阅列表</b>\n\n';
@@ -266,7 +272,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
       const accounts = await getAccounts(db);
       const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
       if (accounts.length === 0) {
-        await sendMessage(token, chatId, '� 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+        await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
         break;
       }
       let msg = '📡 <b>RSS 订阅链接</b>\n\n';

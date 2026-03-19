@@ -31,13 +31,21 @@ export async function sendPhoto(token, chatId, photoBytes, caption = '') {
   return resp.json();
 }
 
-export async function setWebhook(token, url) {
+export async function setWebhook(token, url, secretToken = '') {
+  const body = { url };
+  if (secretToken) body.secret_token = secretToken;
   const resp = await fetch(`${TG_API}${token}/setWebhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url })
+    body: JSON.stringify(body)
   });
   return resp.json();
+}
+
+export function verifyWebhookSecret(request, expectedSecret) {
+  if (!expectedSecret) return true;
+  const header = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+  return header === expectedSecret;
 }
 
 export function parseCommand(text) {
