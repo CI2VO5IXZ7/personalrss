@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import {
   getAccounts, getAccountsByPlatform, getAccount,
   addAccount, removeAccount,
-  getCachedPosts, upsertPosts, isCacheStale, rowToPost,
+  getCachedPosts, getCachedPostIds, upsertPosts, isCacheStale, rowToPost,
   getApiUsage, getApiUsageSummary
 } from './db.js';
 import { generateInstagramFeed, generateXhsFeed } from './rss.js';
@@ -127,7 +127,8 @@ app.get('/rss/xhs/:userId', async c => {
 
   if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
-      fetchXhs(c.env, userId)
+      getCachedPostIds(db, 'xhs', userId)
+        .then(existingIds => fetchXhs(c.env, userId, existingIds))
         .then(newPosts => upsertPosts(db, 'xhs', userId, newPosts))
         .catch(async e => {
           console.error(`[bg-xhs] ${userId}: ${e.message}`);
@@ -335,11 +336,19 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
       await sendMessage(token, chatId, '🔄 正在刷新所有缓存...');
       try {
         const results = await refreshAllCaches(env);
+        const hasNew = results.some(r => r.ok && (r.newCount || 0) > 0);
         let msg = '✅ <b>缓存刷新完成</b>\n\n';
         for (const r of results) {
-          msg += r.ok
-            ? `✅ ${r.platform} ${r.id}: ${r.posts} 条\n`
-            : `❌ ${r.platform} ${r.id}: ${r.error}\n`;
+          if (!r.ok) {
+            msg += `❌ ${r.platform} ${r.id}: ${r.error}\n`;
+          } else if ((r.newCount || 0) > 0) {
+            msg += `✅ ${r.platform} ${r.id}: ${r.posts} 条新内容\n`;
+          } else {
+            msg += `ℹ️ ${r.platform} ${r.id}: 无新更新\n`;
+          }
+        }
+        if (!hasNew && results.every(r => r.ok)) {
+          msg += '\n📭 所有订阅均无新更新。';
         }
         await sendMessage(token, chatId, msg);
       } catch (e) {
@@ -363,9 +372,9 @@ async function refreshAllCaches(env) {
   for (const a of igAccounts) {
     try {
       const newPosts = await fetchIg(a.user_id);
-      await upsertPosts(db, 'ig', a.user_id, newPosts);
-      results.push({ platform: 'ig', id: a.user_id, posts: newPosts.length, ok: true });
-      console.log(`[cron] IG @${a.user_id}: ${newPosts.length} posts`);
+      const { newCount } = await upsertPosts(db, 'ig', a.user_id, newPosts);
+      results.push({ platform: 'ig', id: a.user_id, posts: newPosts.length, newCount, ok: true });
+      console.log(`[cron] IG @${a.user_id}: ${newPosts.length} posts, ${newCount} new`);
     } catch (e) {
       results.push({ platform: 'ig', id: a.user_id, ok: false, error: e.message });
       console.error(`[cron] IG @${a.user_id} failed: ${e.message}`);
@@ -376,10 +385,11 @@ async function refreshAllCaches(env) {
   let xhsApiAlerted = false;
   for (const a of xhsAccounts) {
     try {
-      const newPosts = await fetchXhs(env, a.user_id);
-      await upsertPosts(db, 'xhs', a.user_id, newPosts);
-      results.push({ platform: 'xhs', id: a.user_id, posts: newPosts.length, ok: true });
-      console.log(`[cron] XHS ${a.user_id}: ${newPosts.length} posts`);
+      const existingIds = await getCachedPostIds(db, 'xhs', a.user_id);
+      const newPosts = await fetchXhs(env, a.user_id, existingIds);
+      const { newCount } = await upsertPosts(db, 'xhs', a.user_id, newPosts);
+      results.push({ platform: 'xhs', id: a.user_id, posts: newPosts.length, newCount, ok: true });
+      console.log(`[cron] XHS ${a.user_id}: ${newPosts.length} new posts fetched, ${newCount} actually new`);
     } catch (e) {
       results.push({ platform: 'xhs', id: a.user_id, ok: false, error: e.message });
       console.error(`[cron] XHS ${a.user_id} failed: ${e.message}`);

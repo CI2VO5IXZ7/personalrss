@@ -13,7 +13,7 @@ const XHS_BASE = 'https://www.xiaohongshu.com';
 
 // ─── 获取用户笔记列表 ──────────────────────────────────────────────────────
 
-export async function fetchProfile(env, userId) {
+export async function fetchProfile(env, userId, existingIds = new Set()) {
   const token = env.TIKHUB_API_TOKEN;
   if (!token) {
     throw Object.assign(new Error('[xhs] TIKHUB_API_TOKEN not configured'), { code: 'NO_API_TOKEN' });
@@ -49,7 +49,13 @@ export async function fetchProfile(env, userId) {
   for (const note of notes) {
     const noteId = note.id || note.note_id || '';
     const noteType = note.type || 'normal';
-    // 根据列表中的 type 直接调用对应的详情接口
+
+    // 增量逻辑：已缓存的笔记跳过详情 API 调用
+    if (existingIds.has(noteId)) {
+      continue;
+    }
+
+    // 只对新笔记调用对应的详情接口
     const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
 
     try {
@@ -75,6 +81,7 @@ export async function fetchProfile(env, userId) {
     if (parsed) results.push(parsed);
   }
 
+  console.log(`[xhs] ${userId}: ${notes.length} notes in list, ${existingIds.size} cached, ${results.length} new fetched`);
   return results;
 }
 

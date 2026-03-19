@@ -50,6 +50,15 @@ export async function removeAccount(db, platform, userId) {
 
 // ─── Posts Cache ──────────────────────────────────────────────────────────────
 
+export async function getCachedPostIds(db, platform, userId) {
+  try {
+    const { results } = await db.prepare(
+      'SELECT post_id FROM posts_cache WHERE platform = ? AND user_id = ?'
+    ).bind(platform, userId).all();
+    return new Set((results || []).map(r => r.post_id));
+  } catch { return new Set(); }
+}
+
 export async function getCachedPosts(db, platform, userId, limit = 50) {
   try {
     const { results } = await db.prepare(
@@ -60,8 +69,11 @@ export async function getCachedPosts(db, platform, userId, limit = 50) {
 }
 
 export async function upsertPosts(db, platform, userId, posts) {
-  if (!posts || posts.length === 0) return;
+  if (!posts || posts.length === 0) return { total: 0, newCount: 0 };
   try {
+    const existingIds = await getCachedPostIds(db, platform, userId);
+    const newCount = posts.filter(p => !existingIds.has(p.id || p.post_id || '')).length;
+
     const stmt = db.prepare(
       `INSERT OR REPLACE INTO posts_cache (platform, user_id, post_id, title, description, link, image, date, raw_images, fetched_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
@@ -77,8 +89,10 @@ export async function upsertPosts(db, platform, userId, posts) {
       JSON.stringify(p.raw_images || [])
     ));
     await db.batch(batch);
+    return { total: posts.length, newCount };
   } catch (e) {
     console.error('[db] upsertPosts error:', e.message);
+    return { total: posts.length, newCount: 0 };
   }
 }
 
