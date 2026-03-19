@@ -47,7 +47,15 @@ function buildItemsXml(items, baseUrl) {
 
 function buildDefaultDesc(post) {
   let html = '';
-  if (post.image) html += `<p><img src="${post.image}" style="max-width:100%"/></p>`;
+  // 优先使用 raw_images 多图展示
+  const rawImages = post.raw_images || [];
+  if (rawImages.length > 0) {
+    for (const imgUrl of rawImages) {
+      html += `<p><img src="${imgUrl}" style="max-width:100%"/></p>`;
+    }
+  } else if (post.image) {
+    html += `<p><img src="${post.image}" style="max-width:100%"/></p>`;
+  }
   if (post.description) html += `<p>${post.description.replace(/\n/g, '<br/>')}</p>`;
   return html || '<p>（无内容）</p>';
 }

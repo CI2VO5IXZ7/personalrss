@@ -2,27 +2,23 @@ name = "social-rss-bridge"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
-# KV Namespaces — 部署前需先创建，填入实际 ID
-# 运行: wrangler kv:namespace create CACHE
-# 运行: wrangler kv:namespace create COOKIES
-kv_namespaces = [
-  { binding = "CACHE",   id = "892b6f0286954f17b466a744bcdee449",   preview_id = "892b6f0286954f17b466a744bcdee449" },
-  { binding = "COOKIES", id = "59a3a838178a476c98539aa097a59262", preview_id = "59a3a838178a476c98539aa097a59262" }
-]
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "social-rss-bridge-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
 
-# Cron Triggers — 每小时刷新缓存（刷新时自动检测 Cookie 失效）
+# Cron Triggers — 每小时刷新缓存
 [triggers]
 crons = ["0 * * * *"]
 
 [vars]
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
-# 账号配置 — 可在 CF 控制台 Workers → Settings → Variables 中直接编辑
-ACCOUNTS_JSON = '{"instagram":[{"username":"jjlin","displayName":"林俊杰的ins"},{"username":"Silencewang.0917","displayName":"汪苏泷的ins"},{"username":"patti_yc","displayName":"蔡宥绮的ins"}],"xiaohongshu":[{"userId":"62b97a76000000001b02b560","displayName":"罗曼城氛围组"},{"userId":"6979812a000000002102c464","displayName":"罗曼星球"}]}'
 
 # Secrets (通过 wrangler secret put 设置，不进代码仓库):
-# CF_ACCOUNT_ID       - Cloudflare 账户 ID
-# CF_API_TOKEN        - Cloudflare API Token (需 Browser Rendering 权限)
+# TIKHUB_API_TOKEN    - TikHub API Bearer Token (小红书数据抓取)
 # TELEGRAM_BOT_TOKEN  - Telegram Bot Token
 # TELEGRAM_CHAT_ID    - Telegram 接收消息的 Chat ID
 # ADMIN_TOKEN         - 管理接口鉴权 Token

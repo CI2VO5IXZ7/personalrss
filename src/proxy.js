@@ -3,7 +3,9 @@
 // 允许代理的域名白名单
 const ALLOWED_HOSTS = [
   'instagram.', 'cdninstagram.com', 'fbcdn.net',
-  'xhscdn.com', 'xiaohongshu.com', 'sns-img'
+  'xhscdn.com', 'xiaohongshu.com', 'sns-img',
+  'xhscdn.net', 'sns-webpic', 'ci.xiaohongshu',
+  'sns-avatar', 'sns-video', 'xhs-cn'
 ];
 
 function isAllowedUrl(url) {

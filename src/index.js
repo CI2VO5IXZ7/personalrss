@@ -1,10 +1,14 @@
 import { Hono } from 'hono';
-import { readCache, writeCache, isCacheStale, readCookies, getAccounts } from './store.js';
+import {
+  getAccounts, getAccountsByPlatform, getAccount,
+  addAccount, removeAccount,
+  getCachedPosts, upsertPosts, isCacheStale, rowToPost
+} from './db.js';
 import { generateInstagramFeed, generateXhsFeed } from './rss.js';
-import { sendMessage, sendPhoto, setWebhook, parseCommand } from './telegram.js';
+import { sendMessage, setWebhook, parseCommand } from './telegram.js';
 import { handleImageProxy } from './proxy.js';
 import { fetchProfile as fetchIg } from './crawlers/instagram.js';
-import { fetchProfile as fetchXhs, startQRLogin, confirmLogin } from './crawlers/xhs.js';
+import { fetchProfile as fetchXhs } from './crawlers/xhs_tikhub.js';
 
 const app = new Hono();
 
@@ -27,55 +31,32 @@ function rssResponse(xml) {
   });
 }
 
-// 合并去重：新数据 + 旧缓存，按时间排序，保留最新 50 条
-function mergePosts(newPosts, cachedPosts) {
-  const map = new Map();
-  const seenLinks = new Set();
-
-  function addPost(p) {
-    if (!p) return;
-    // 优先按 id 去重，再按 link 去重（防止 CDN URL 变化导致 id 不同但实际是同一帖子）
-    if (p.id && map.has(p.id)) { map.set(p.id, p); return; }
-    if (p.link && seenLinks.has(p.link)) return;
-    if (p.id) map.set(p.id, p);
-    if (p.link) seenLinks.add(p.link);
-  }
-
-  // 旧数据先放入
-  for (const p of (cachedPosts || [])) addPost(p);
-  // 新数据覆盖
-  for (const p of (newPosts || [])) addPost(p);
-
-  return [...map.values()]
-    .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
-    .slice(0, 50);
-}
-
 // ─── 首页 ─────────────────────────────────────────────────────────────────────
 
-app.get('/', c => {
-  const accounts = getAccounts(c.env);
+app.get('/', async c => {
+  const db = c.env.DB;
+  const accounts = await getAccounts(db);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
-  const igFeeds = (accounts.instagram || []).map(a => ({
-    platform: 'Instagram', name: a.displayName || a.username,
-    rssUrl: `${baseUrl}/rss/ig/${a.username}`
+  const feeds = accounts.map(a => ({
+    platform: a.platform === 'instagram' ? 'Instagram' : '小红书',
+    name: a.display_name || a.user_id,
+    rssUrl: a.platform === 'instagram'
+      ? `${baseUrl}/rss/ig/${a.user_id}`
+      : `${baseUrl}/rss/xhs/${a.user_id}`
   }));
-  const xhsFeeds = (accounts.xiaohongshu || []).map(a => ({
-    platform: '小红书', name: a.displayName || a.userId,
-    rssUrl: `${baseUrl}/rss/xhs/${a.userId}`
-  }));
-  return c.json({ service: 'Social RSS Bridge', status: 'running', feeds: [...igFeeds, ...xhsFeeds] });
+  return c.json({ service: 'Social RSS Bridge', status: 'running', feeds });
 });
 
 // ─── 状态 ─────────────────────────────────────────────────────────────────────
 
 app.get('/status', async c => {
-  const xhsCookies = await readCookies(c.env, 'xhs');
+  const db = c.env.DB;
+  const igAccounts = await getAccountsByPlatform(db, 'instagram');
+  const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
   return c.json({
-    xiaohongshu: {
-      hasCookies: !!xhsCookies?.cookies?.length,
-      savedAt: xhsCookies?.savedAt || null
-    },
+    instagram: { accounts: igAccounts.length, method: 'Public API' },
+    xiaohongshu: { accounts: xhsAccounts.length, method: 'TikHub API' },
+    tikhub: { configured: !!c.env.TIKHUB_API_TOKEN },
     worker: 'active'
   });
 });
@@ -84,75 +65,71 @@ app.get('/status', async c => {
 
 app.get('/img', handleImageProxy);
 
-// ─── Instagram RSS（缓存优先）─────────────────────────────────────────────────
+// ─── Instagram RSS（D1 缓存优先）──────────────────────────────────────────────
 
 app.get('/rss/ig/:username', async c => {
   const { username } = c.req.param();
-  const accounts = getAccounts(c.env);
-  const account = (accounts.instagram || []).find(a => a.username.toLowerCase() === username.toLowerCase());
-  
+  const db = c.env.DB;
+  const account = await getAccount(db, 'instagram', username);
+
   if (!account) {
     return c.text('Forbidden: Account not in whitelist', 403);
   }
 
-  const displayName = account.displayName || username;
+  const displayName = account.display_name || username;
   const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
 
-  const cached = await readCache(c.env, 'ig', username);
-  const stale = await isCacheStale(c.env, 'ig', username, ttl);
+  const cachedRows = await getCachedPosts(db, 'ig', username);
+  const cachedPosts = cachedRows.map(rowToPost);
+  const stale = await isCacheStale(db, 'ig', username, ttl);
 
-  if (stale || !cached?.posts) {
+  if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
       fetchIg(username)
-        .then(newPosts => {
-          const merged = mergePosts(newPosts, cached?.posts);
-          return writeCache(c.env, 'ig', username, { posts: merged, updatedAt: new Date().toISOString() }, ttl);
-        })
+        .then(newPosts => upsertPosts(db, 'ig', username, newPosts))
         .catch(e => console.error(`[bg-ig] ${username}: ${e.message}`))
     );
   }
 
-  return rssResponse(generateInstagramFeed(username, displayName, cached?.posts || [], baseUrl));
+  return rssResponse(generateInstagramFeed(username, displayName, cachedPosts, baseUrl));
 });
 
-// ─── 小红书 RSS（缓存优先）────────────────────────────────────────────────────
+// ─── 小红书 RSS（D1 缓存优先，TikHub API）─────────────────────────────────────
 
 app.get('/rss/xhs/:userId', async c => {
   const { userId } = c.req.param();
-  const accounts = getAccounts(c.env);
-  const account = (accounts.xiaohongshu || []).find(a => a.userId === userId);
-  
+  const db = c.env.DB;
+  const account = await getAccount(db, 'xiaohongshu', userId);
+
   if (!account) {
     return c.text('Forbidden: Account not in whitelist', 403);
   }
 
-  const displayName = account.displayName || userId;
+  const displayName = account.display_name || userId;
   const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
 
-  const cached = await readCache(c.env, 'xhs', userId);
-  const stale = await isCacheStale(c.env, 'xhs', userId, ttl);
+  const cachedRows = await getCachedPosts(db, 'xhs', userId);
+  const cachedPosts = cachedRows.map(rowToPost);
+  const stale = await isCacheStale(db, 'xhs', userId, ttl);
 
-  if (stale || !cached?.posts) {
+  if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
       fetchXhs(c.env, userId)
-        .then(newPosts => {
-          const merged = mergePosts(newPosts, cached?.posts);
-          return writeCache(c.env, 'xhs', userId, { posts: merged, updatedAt: new Date().toISOString() }, ttl);
-        })
+        .then(newPosts => upsertPosts(db, 'xhs', userId, newPosts))
         .catch(async e => {
           console.error(`[bg-xhs] ${userId}: ${e.message}`);
-          if (e.code === 'COOKIE_EXPIRED' || e.code === 'NO_COOKIES') {
+          if (e.code === 'NO_API_TOKEN') {
             await sendMessage(c.env.TELEGRAM_BOT_TOKEN, c.env.TELEGRAM_CHAT_ID,
-              `⚠️ 小红书 Cookie 已失效！请使用 /refresh_xhs 重新登录。`
+              '⚠️ TIKHUB_API_TOKEN 未配置，小红书数据无法获取。'
             ).catch(() => {});
           }
         })
     );
   }
 
-  return rssResponse(generateXhsFeed(userId, displayName, cached?.posts || [], baseUrl));
+  return rssResponse(generateXhsFeed(userId, displayName, cachedPosts, baseUrl));
 });
 
 // ─── Telegram Webhook 设置（部署后调用一次）──────────────────────────────────
@@ -164,18 +141,6 @@ app.get('/setup-webhook', async c => {
   const baseUrl = getBaseUrl(c.env, c.req.raw);
   const result = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`);
   return c.json(result);
-});
-
-// ─── Admin: 手动上传 XHS Cookies ──────────────────────────────────────────────
-
-app.post('/admin/set-xhs-cookies', async c => {
-  if (!c.env.ADMIN_TOKEN || c.req.query('token') !== c.env.ADMIN_TOKEN) {
-    return c.json({ error: 'Unauthorized' }, 401);
-  }
-  const cookies = await c.req.json();
-  const { writeCookies } = await import('./store.js');
-  await writeCookies(c.env, 'xhs', cookies);
-  return c.json({ ok: true, count: cookies.length });
 });
 
 // ─── Admin: 手动刷新缓存 ─────────────────────────────────────────────────────
@@ -213,68 +178,117 @@ app.post('/telegram', async c => {
 // ─── Telegram 命令处理 ────────────────────────────────────────────────────────
 
 async function handleCommand({ cmd, args }, env, chatId, token) {
-  const accounts = getAccounts(env);
+  const db = env.DB;
 
   switch (cmd) {
     case 'start':
     case 'help':
       await sendMessage(token, chatId,
         '🤖 <b>Social RSS Bridge</b>\n\n' +
+        '<b>订阅管理：</b>\n' +
+        '/add_ig &lt;username&gt; [displayName] — 添加 IG 订阅\n' +
+        '/add_xhs &lt;userId&gt; [displayName] — 添加小红书订阅\n' +
+        '/remove_ig &lt;username&gt; — 删除 IG 订阅\n' +
+        '/remove_xhs &lt;userId&gt; — 删除小红书订阅\n' +
+        '/list — 列出所有订阅\n\n' +
+        '<b>其他：</b>\n' +
+        '/feeds — 列出 RSS 链接\n' +
         '/status — 查看服务状态\n' +
-        '/feeds — 列出所有 RSS 链接\n' +
-        '/refresh_xhs — 触发小红书扫码登录\n' +
-        '/confirm_xhs — 扫码后确认登录状态\n' +
-        '/refresh — 立即刷新所有缓存\n' +
+        '/refresh — 立即刷新缓存\n' +
         '/help — 显示此帮助');
       break;
 
-    case 'feeds': {
-      const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
-      let msg = '📡 <b>RSS 订阅链接</b>\n\n';
-      for (const a of (accounts.instagram || [])) {
-        msg += `📸 ${a.displayName || a.username}\n<code>${baseUrl}/rss/ig/${a.username}</code>\n\n`;
+    case 'add_ig': {
+      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_ig &lt;username&gt; [displayName]'); break; }
+      const username = args[0];
+      const displayName = args.slice(1).join(' ') || username;
+      const ok = await addAccount(db, 'instagram', username, displayName);
+      if (ok) {
+        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+        await sendMessage(token, chatId,
+          `✅ 已添加 Instagram 订阅：<b>${displayName}</b>\n\n📡 RSS: <code>${baseUrl}/rss/ig/${username}</code>`);
+      } else {
+        await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：${username}`);
       }
-      for (const a of (accounts.xiaohongshu || [])) {
-        msg += `🍠 ${a.displayName || a.userId}\n<code>${baseUrl}/rss/xhs/${a.userId}</code>\n\n`;
+      break;
+    }
+
+    case 'add_xhs': {
+      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_xhs &lt;userId&gt; [displayName]'); break; }
+      const userId = args[0];
+      const displayName = args.slice(1).join(' ') || userId;
+      const ok = await addAccount(db, 'xiaohongshu', userId, displayName);
+      if (ok) {
+        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+        await sendMessage(token, chatId,
+          `✅ 已添加小红书订阅：<b>${displayName}</b>\n\n📡 RSS: <code>${baseUrl}/rss/xhs/${userId}</code>`);
+      } else {
+        await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：${userId}`);
+      }
+      break;
+    }
+
+    case 'remove_ig': {
+      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_ig &lt;username&gt;'); break; }
+      const ok = await removeAccount(db, 'instagram', args[0]);
+      await sendMessage(token, chatId, ok
+        ? `✅ 已删除 Instagram 订阅：${args[0]}`
+        : `⚠️ 未找到该订阅：${args[0]}`);
+      break;
+    }
+
+    case 'remove_xhs': {
+      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_xhs &lt;userId&gt;'); break; }
+      const ok = await removeAccount(db, 'xiaohongshu', args[0]);
+      await sendMessage(token, chatId, ok
+        ? `✅ 已删除小红书订阅：${args[0]}`
+        : `⚠️ 未找到该订阅：${args[0]}`);
+      break;
+    }
+
+    case 'list': {
+      const accounts = await getAccounts(db);
+      if (accounts.length === 0) {
+        await sendMessage(token, chatId, '� 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+        break;
+      }
+      let msg = '📋 <b>订阅列表</b>\n\n';
+      for (const a of accounts) {
+        const icon = a.platform === 'instagram' ? '📸' : '🍠';
+        const plat = a.platform === 'instagram' ? 'IG' : 'XHS';
+        msg += `${icon} [${plat}] <b>${a.display_name || a.user_id}</b>\n   ID: <code>${a.user_id}</code>\n\n`;
+      }
+      await sendMessage(token, chatId, msg);
+      break;
+    }
+
+    case 'feeds': {
+      const accounts = await getAccounts(db);
+      const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+      if (accounts.length === 0) {
+        await sendMessage(token, chatId, '� 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+        break;
+      }
+      let msg = '📡 <b>RSS 订阅链接</b>\n\n';
+      for (const a of accounts) {
+        const icon = a.platform === 'instagram' ? '📸' : '🍠';
+        const path = a.platform === 'instagram' ? `rss/ig/${a.user_id}` : `rss/xhs/${a.user_id}`;
+        msg += `${icon} ${a.display_name || a.user_id}\n<code>${baseUrl}/${path}</code>\n\n`;
       }
       await sendMessage(token, chatId, msg);
       break;
     }
 
     case 'status': {
-      const xhsCookies = await readCookies(env, 'xhs');
+      const igAccounts = await getAccountsByPlatform(db, 'instagram');
+      const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
       let msg = '📊 <b>服务状态</b>\n\n';
-      msg += '📸 Instagram：无需 Cookie（公开 API）\n\n';
-      msg += '🍠 小红书：\n';
-      msg += xhsCookies?.cookies?.length
-        ? `  Cookie: ✅ 已保存 (${new Date(xhsCookies.savedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })})\n`
-        : '  Cookie: ❌ 未设置，使用 /refresh_xhs 登录\n';
+      msg += `📸 Instagram：${igAccounts.length} 个订阅（公开 API）\n\n`;
+      msg += `🍠 小红书：${xhsAccounts.length} 个订阅（TikHub API）\n`;
+      msg += `   API Token: ${env.TIKHUB_API_TOKEN ? '✅ 已配置' : '❌ 未配置'}\n`;
       await sendMessage(token, chatId, msg);
       break;
     }
-
-    case 'refresh_xhs':
-      await sendMessage(token, chatId, '🔄 正在启动小红书扫码登录，请稍候...');
-      try {
-        await startQRLogin(env);
-      } catch (e) {
-        await sendMessage(token, chatId, `❌ 启动 QR 登录失败：${e.message}`);
-      }
-      break;
-
-    case 'confirm_xhs':
-      await sendMessage(token, chatId, '🔍 正在检查登录状态...');
-      try {
-        const result = await confirmLogin(env);
-        if (result.success) {
-          await sendMessage(token, chatId, `✅ ${result.message}`);
-        } else {
-          await sendMessage(token, chatId, `⚠️ ${result.message}`);
-        }
-      } catch (e) {
-        await sendMessage(token, chatId, `❌ 确认失败：${e.message}`);
-      }
-      break;
 
     case 'refresh':
       await sendMessage(token, chatId, '🔄 正在刷新所有缓存...');
@@ -301,41 +315,37 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
 async function refreshAllCaches(env) {
   console.log('[cron] Starting cache refresh...');
-  const accounts = getAccounts(env);
-  const ttl = parseInt(env.CACHE_TTL_MINUTES || '60', 10);
+  const db = env.DB;
   const results = [];
 
-  for (const a of (accounts.instagram || [])) {
+  const igAccounts = await getAccountsByPlatform(db, 'instagram');
+  for (const a of igAccounts) {
     try {
-      const cached = await readCache(env, 'ig', a.username);
-      const newPosts = await fetchIg(a.username);
-      const merged = mergePosts(newPosts, cached?.posts);
-      await writeCache(env, 'ig', a.username, { posts: merged, updatedAt: new Date().toISOString() }, ttl);
-      results.push({ platform: 'ig', id: a.username, posts: merged.length, ok: true });
-      console.log(`[cron] IG @${a.username}: ${merged.length} posts`);
+      const newPosts = await fetchIg(a.user_id);
+      await upsertPosts(db, 'ig', a.user_id, newPosts);
+      results.push({ platform: 'ig', id: a.user_id, posts: newPosts.length, ok: true });
+      console.log(`[cron] IG @${a.user_id}: ${newPosts.length} posts`);
     } catch (e) {
-      results.push({ platform: 'ig', id: a.username, ok: false, error: e.message });
-      console.error(`[cron] IG @${a.username} failed: ${e.message}`);
+      results.push({ platform: 'ig', id: a.user_id, ok: false, error: e.message });
+      console.error(`[cron] IG @${a.user_id} failed: ${e.message}`);
     }
   }
 
-  let xhsCookieAlerted = false;
-  for (const a of (accounts.xiaohongshu || [])) {
+  const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
+  let xhsApiAlerted = false;
+  for (const a of xhsAccounts) {
     try {
-      const cached = await readCache(env, 'xhs', a.userId);
-      const newPosts = await fetchXhs(env, a.userId);
-      const merged = mergePosts(newPosts, cached?.posts);
-      await writeCache(env, 'xhs', a.userId, { posts: merged, updatedAt: new Date().toISOString() }, ttl);
-      results.push({ platform: 'xhs', id: a.userId, posts: merged.length, ok: true });
-      console.log(`[cron] XHS ${a.userId}: ${merged.length} posts`);
+      const newPosts = await fetchXhs(env, a.user_id);
+      await upsertPosts(db, 'xhs', a.user_id, newPosts);
+      results.push({ platform: 'xhs', id: a.user_id, posts: newPosts.length, ok: true });
+      console.log(`[cron] XHS ${a.user_id}: ${newPosts.length} posts`);
     } catch (e) {
-      results.push({ platform: 'xhs', id: a.userId, ok: false, error: e.message });
-      console.error(`[cron] XHS ${a.userId} failed: ${e.message}`);
-      // Cookie 失效时通过 Telegram 提醒（每次 cron 只提醒一次）
-      if (!xhsCookieAlerted && (e.code === 'COOKIE_EXPIRED' || e.code === 'NO_COOKIES')) {
-        xhsCookieAlerted = true;
+      results.push({ platform: 'xhs', id: a.user_id, ok: false, error: e.message });
+      console.error(`[cron] XHS ${a.user_id} failed: ${e.message}`);
+      if (!xhsApiAlerted && e.code === 'NO_API_TOKEN') {
+        xhsApiAlerted = true;
         await sendMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID,
-          '⚠️ 小红书 Cookie 已失效！请使用 /refresh_xhs 重新登录。'
+          '⚠️ TIKHUB_API_TOKEN 未配置，小红书数据无法获取。'
         ).catch(() => {});
       }
     }
