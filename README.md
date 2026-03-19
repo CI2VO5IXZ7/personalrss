@@ -17,7 +17,7 @@
 
 - Cloudflare Workers 付费计划（$5/月）
 - [TikHub](https://user.tikhub.io) 账号和 API Token（小红书数据抓取）
-- Telegram Bot（通过 [@BotFather](https://t.me/BotFather) 创建）
+- Telegram Bot
 
 ### Cloudflare API Token 权限
 
