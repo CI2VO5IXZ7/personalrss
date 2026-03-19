@@ -68,7 +68,8 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
           const noteObj = extractNoteFromDetail(detailData.data, endpoint);
           if (noteObj) {
             const parsed = parseNote(noteObj, noteType);
-            if (parsed) { results.push(parsed); continue; }
+            // 强制使用列表 API 的 noteId，避免详情 API 返回不同 ID 导致重复
+            if (parsed) { parsed.id = noteId; parsed.link = `${XHS_BASE}/explore/${noteId}`; results.push(parsed); continue; }
           }
         }
       }
