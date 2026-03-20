@@ -1,96 +1,263 @@
 # Social RSS Bridge
 
-将小红书和 Instagram 的帖子转为标准 RSS 2.0 Feed，部署在 Cloudflare Workers 上。
+将 Instagram 和小红书账号内容转成 RSS 2.0 Feed，运行在 Cloudflare Workers 上，并通过 Telegram Bot 完成订阅管理、状态查看和运维操作。
 
-## 功能
+## 当前功能
 
-- **Instagram RSS**：通过官方内部 API 获取公开 profile 帖子（无需登录）
-- **小红书 RSS**：通过 TikHub API 获取用户笔记（含完整图文内容）
-- **图片代理**：所有 RSS 图片通过 Worker 代理，解决 CDN 签名过期和跨域问题
-- **D1 数据库**：使用 Cloudflare D1 存储订阅配置和帖子缓存
-- **Telegram Bot**：通过 Bot 命令动态管理订阅、查看状态、手动刷新
-- **定时刷新**：每小时自动刷新缓存
+- Instagram RSS：抓取公开账号主页内容并输出 RSS。
+- 小红书 RSS：通过 TikHub API 抓取账号笔记，并区分图文/视频详情接口。
+- 增量抓取：每轮小红书刷新只先调用 `get_user_posted_notes`；只有发现新笔记时，才按类型调用详情接口。
+- 缓存去重：基于 `canonical_id`、`content_hash`、`media_type` 去重，减少历史别名 ID 导致的重复条目。
+- 媒体代理：图片和视频分别通过 `/img`、`/media` 代理，避免直链失效。
+- Telegram Bot 管理：支持添加、删除、刷新、清缓存、查看状态、查看 RSS 链接。
+- Telegram 命令菜单同步：支持把机器人命令菜单同步为当前代码中的完整命令集。
+- 抓取状态与告警：记录最近成功/失败、连续失败次数、最近错误，并在达到阈值时发送 Telegram 告警。
+- 定时刷新：Cloudflare Cron 每小时刷新一次全部订阅缓存。
+
+## 运行要求
+
+- Cloudflare Workers + D1
+- TikHub API Token
+- Telegram Bot Token
+- Node.js 20
+
+仓库内 `.nvmrc` 当前要求：
+
+```txt
+20
+```
+
+## 项目结构
+
+```txt
+Cloudflare Worker
+├─ Hono 路由
+├─ Instagram 抓取
+├─ TikHub 小红书抓取
+├─ D1
+│  ├─ accounts
+│  ├─ posts_cache
+│  └─ crawl_status
+├─ /img 媒体图片代理
+├─ /media 视频代理
+├─ Telegram Webhook
+└─ Cron Trigger
+```
+
+## 环境变量与 Secrets
+
+### 1. 部署脚本使用
+
+这些变量主要给 `deploy.sh` 使用：
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `CF_ACCOUNT_ID` | 是 | Cloudflare Account ID |
+| `CF_API_TOKEN` | 是 | 具备 Workers / D1 编辑权限的 Cloudflare API Token |
+
+### 2. Worker 运行时变量
+
+这些变量可以放在 `wrangler.toml` 的 `[vars]` 中：
+
+| 变量 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `BASE_URL` | 建议 | 当前线上域名 | RSS 链接、Webhook 设置、Telegram 输出里使用的基础域名 |
+| `CACHE_TTL_MINUTES` | 否 | `60` | RSS 请求触发后台刷新时的缓存过期分钟数 |
+| `CACHE_MAX_POSTS` | 否 | `100` | 每个账号在 `posts_cache` 中最多保留的帖子数量 |
+| `REFRESH_CONCURRENCY` | 否 | `3` | 全量刷新时的并发账号数 |
+| `FAILURE_ALERT_THRESHOLD` | 否 | `3` | 连续失败达到该次数后发送 Telegram 告警 |
+| `API_USAGE_ALERT_THRESHOLD` | 否 | `500` | TikHub 单日调用量达到阈值时发送 Telegram 告警，`0` 表示关闭 |
+
+### 3. Worker Secrets
+
+这些变量建议通过 `wrangler secret put` 设置：
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `TIKHUB_API_TOKEN` | 小红书功能必填 | TikHub Bearer Token |
+| `TELEGRAM_BOT_TOKEN` | Telegram 功能必填 | Telegram Bot Token |
+| `TELEGRAM_CHAT_ID` | Telegram 功能必填 | 允许操作机器人的目标 Chat ID |
+| `ADMIN_TOKEN` | 是 | 管理接口认证 Token，同时也作为 Telegram Webhook Secret Token |
 
 ## 部署
 
-### 前置要求
+### 1. 安装依赖
 
-- Cloudflare Workers 付费计划（$5/月）
-- [TikHub](https://user.tikhub.io) 账号和 API Token（小红书数据抓取）
-- Telegram Bot
+```bash
+npm install
+```
 
-### Cloudflare API Token 权限
+### 2. 创建 D1 数据库并执行迁移
 
-在 [Cloudflare Dashboard → My Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens) 中创建 **Custom Token**，需包含以下权限：
+如果你不是通过 `deploy.sh` 一键部署，需要确保 D1 已创建并执行全部迁移：
 
-| 权限 | 说明 |
-|------|------|
-| `Account / Workers Scripts / Edit` | 部署 Worker 代码 |
-| `Account / D1 / Edit` | 创建和读写 D1 数据库 |
+```bash
+npx wrangler d1 migrations apply social-rss-bridge-db
+```
 
-### 步骤
+### 3. 部署 Worker
 
-1. **配置 `.env`**
-   ```bash
-   cp .env.example .env
-   nano .env   # 填入 Cloudflare、TikHub、Telegram 等信息
-   ```
+```bash
+npx wrangler deploy
+```
 
-2. **一键部署**
-   ```bash
-   ./deploy.sh
-   ```
-   脚本会自动完成：安装依赖 → 创建 D1 数据库 → 执行迁移 → 部署 Worker → 设置 Secrets → 配置 Telegram Webhook。
+### 4. 设置 Telegram Webhook 并同步机器人命令菜单
 
-3. **通过 Telegram Bot 添加订阅**
+部署完成后，调用：
 
-   部署完成后，在 Telegram 中向 Bot 发送命令：
-   ```
-   /add_ig jjlin 林俊杰的ins
-   /add_ig Silencewang.0917 汪苏泷的ins
-   /add_xhs 62b97a76000000001b02b560 罗曼城氛围组
-   /add_xhs 6979812a000000002102c464 罗曼星球
-   ```
+```bash
+curl -X POST "https://<your-worker-domain>/setup-webhook" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
 
-   - **Instagram `username`**：用户主页 URL 中 `instagram.com/` 后面的部分
-   - **小红书 `userId`**：用户主页 URL 中 `user/profile/` 后面的 24 位 ID
+这个接口会同时完成两件事：
 
-## API 端点
+- 设置 Telegram Webhook 到 `/telegram`
+- 调用 Telegram `setMyCommands`，把机器人命令菜单同步成当前代码支持的命令
 
-| 端点 | 说明 |
-|------|------|
-| `GET /` | 列出所有 RSS 链接 |
-| `GET /status` | 服务状态 |
-| `GET /rss/ig/:username` | Instagram RSS |
-| `GET /rss/xhs/:userId` | 小红书 RSS |
-| `GET /img?url=xxx` | 图片代理 |
-| `POST /telegram` | Telegram Webhook |
-| `GET /setup-webhook?token=` | 设置 Telegram Webhook |
-| `GET /admin/refresh?token=` | 手动刷新所有缓存 |
+## 对外接口
 
-## Telegram Bot 命令
+### RSS 与代理接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/rss/ig/:username` | Instagram RSS |
+| `GET` | `/rss/xhs/:userId` | 小红书 RSS |
+| `GET` | `/img?url=...` | 图片代理 |
+| `GET` | `/media?url=...` | 视频代理 |
+
+### Telegram 与管理接口
+
+| 方法 | 路径 | 认证 | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `/telegram` | Telegram Webhook Secret | Telegram Webhook 接收入口 |
+| `POST` | `/setup-webhook` | `Authorization: Bearer <ADMIN_TOKEN>` | 设置 Telegram Webhook，并同步命令菜单 |
+| `POST` | `/admin/refresh` | `Authorization: Bearer <ADMIN_TOKEN>` | 手动刷新全部缓存 |
+| `POST` | `/admin/sync-telegram-commands` | `Authorization: Bearer <ADMIN_TOKEN>` | 单独同步 Telegram 命令菜单 |
+
+### 已关闭的公开页面
+
+以下页面当前默认关闭，不再对外公开：
+
+- `/`
+- `/status`
+
+服务状态查看统一通过 Telegram `/status` 完成。
+
+## Telegram 命令
+
+### 订阅管理
 
 | 命令 | 说明 |
-|------|------|
+| --- | --- |
 | `/add_ig <username> [displayName]` | 添加 Instagram 订阅 |
 | `/add_xhs <userId> [displayName]` | 添加小红书订阅 |
 | `/remove_ig <username>` | 删除 Instagram 订阅 |
 | `/remove_xhs <userId>` | 删除小红书订阅 |
-| `/list` | 列出所有订阅账号 |
-| `/feeds` | 列出所有 RSS 订阅链接 |
-| `/status` | 查看服务状态 |
-| `/refresh` | 立即刷新所有缓存 |
+| `/list` | 列出当前全部订阅 |
+
+### 运维命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `/feeds` | 列出所有 RSS 链接 |
+| `/status` | 查看服务状态、抓取摘要和异常账号 |
+| `/api_usage [days]` | 查看近 N 天 TikHub API 调用量 |
+| `/refresh` | 手动刷新全部缓存 |
+| `/refresh_ig <username>` | 刷新单个 Instagram 订阅 |
+| `/refresh_xhs <userId>` | 刷新单个小红书订阅 |
+| `/purge_ig <username>` | 清理单个 Instagram 缓存 |
+| `/purge_xhs <userId>` | 清理单个小红书缓存 |
+| `/sync_commands` | 同步 Telegram 机器人命令菜单 |
 | `/help` | 显示帮助 |
+| `/start` | 显示帮助 |
 
-## 架构
+## 抓取与缓存行为
 
+### Instagram
+
+- RSS 请求优先读取缓存。
+- 缓存过期或为空时，后台异步刷新。
+
+### 小红书
+
+- 每轮刷新先调用一次 `get_user_posted_notes`。
+- 只对新笔记调用详情接口。
+- `type=video` 使用 `get_video_note_detail`。
+- 其他类型默认使用 `get_image_note_detail`。
+- 详情接口失败时，会回退到列表数据，避免整条笔记完全丢失。
+
+### 去重与裁剪
+
+- `posts_cache` 会存储：
+  - `canonical_id`
+  - `content_hash`
+  - `media_type`
+- 写入后会自动去重。
+- 每个账号缓存会按 `CACHE_MAX_POSTS` 自动裁剪旧数据。
+
+## 状态、日志与告警
+
+系统会记录每个账号的：
+
+- 最近一次尝试时间
+- 最近一次成功时间
+- 最近结果
+- 最近错误
+- 连续失败次数
+- 最近帖子数
+- 最近新增数
+- 最近耗时
+
+当连续失败次数达到 `FAILURE_ALERT_THRESHOLD` 时，会向 Telegram 发送告警。
+
+当 TikHub 当日调用量达到 `API_USAGE_ALERT_THRESHOLD` 时，也会发送告警。
+
+## 本地开发与检查
+
+### 安装依赖
+
+```bash
+npm install
 ```
-CF Worker
-├── Hono 路由
-├── Instagram 内部 API（无需登录）
-├── TikHub Xiaohongshu-App-V2-API（小红书抓取）
-├── Cloudflare D1（订阅配置 + 帖子缓存）
-├── 图片代理（/img?url=）
-├── Telegram Webhook（订阅管理 + 状态查看）
-└── Cron Trigger（每小时刷新）
+
+### 本地构建检查
+
+```bash
+npx wrangler deploy --dry-run
 ```
+
+### 推荐检查项
+
+- `npm install`
+- `npx wrangler deploy --dry-run`
+- Telegram 命令菜单同步后，手动在机器人里执行 `/help` 和 `/sync_commands`
+
+## 常见运维操作
+
+### 手动刷新全部缓存
+
+```bash
+curl -X POST "https://<your-worker-domain>/admin/refresh" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
+
+### 单独同步 Telegram 命令菜单
+
+```bash
+curl -X POST "https://<your-worker-domain>/admin/sync-telegram-commands" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
+
+### 通过 Telegram 添加订阅
+
+```txt
+/add_ig Silencewang.0917 汪苏泷的ins
+/add_xhs 62b97a76000000001b02b560 罗曼城氛围组
+```
+
+## 说明
+
+- 只有已加入白名单的账号才允许通过 RSS 接口访问。
+- RSS 页面本身不再提供公开索引页。
+- 小红书抓取依赖 TikHub；如果上游返回异常，系统会记录失败并参与告警计数。
