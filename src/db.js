@@ -14,6 +14,15 @@ function normalizeWhitespace(value = '') {
   return String(value).replace(/\s+/g, ' ').trim();
 }
 
+function isCaseInsensitivePlatform(platform) {
+  return platform === 'instagram' || platform === 'ig';
+}
+
+function normalizeUserId(platform, userId = '') {
+  const normalized = String(userId).trim();
+  return isCaseInsensitivePlatform(platform) ? normalized.toLowerCase() : normalized;
+}
+
 function hashString(input) {
   let hash = 2166136261;
   for (let i = 0; i < input.length; i += 1) {
@@ -99,22 +108,55 @@ export async function getAccounts(db) {
 
 export async function getAccountsByPlatform(db, platform) {
   try {
-    const { results } = await db.prepare('SELECT * FROM accounts WHERE platform = ?').bind(platform).all();
-    return results || [];
+    const { results } = await db.prepare(
+      'SELECT * FROM accounts WHERE platform = ? ORDER BY created_at DESC'
+    ).bind(platform).all();
+
+    if (!isCaseInsensitivePlatform(platform)) {
+      return results || [];
+    }
+
+    const deduped = [];
+    const seen = new Set();
+    for (const row of results || []) {
+      const key = normalizeUserId(platform, row.user_id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push({ ...row, user_id: key });
+    }
+    return deduped;
   } catch { return []; }
 }
 
 export async function getAccount(db, platform, userId) {
   try {
+    const normalizedUserId = normalizeUserId(platform, userId);
+    if (isCaseInsensitivePlatform(platform)) {
+      const row = await db.prepare(
+        `SELECT * FROM accounts
+         WHERE platform = ? AND LOWER(user_id) = ?
+         ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, created_at DESC
+         LIMIT 1`
+      ).bind(platform, normalizedUserId, normalizedUserId).first();
+
+      return row ? { ...row, user_id: normalizedUserId } : null;
+    }
+
     return await db.prepare('SELECT * FROM accounts WHERE platform = ? AND user_id = ?')
-      .bind(platform, userId).first();
+      .bind(platform, normalizedUserId).first();
   } catch { return null; }
 }
 
 export async function addAccount(db, platform, userId, displayName = '') {
   try {
+    const normalizedUserId = normalizeUserId(platform, userId);
+    if (isCaseInsensitivePlatform(platform)) {
+      const existing = await getAccount(db, platform, normalizedUserId);
+      if (existing) return false;
+    }
+
     const result = await db.prepare('INSERT OR IGNORE INTO accounts (platform, user_id, display_name) VALUES (?, ?, ?)')
-      .bind(platform, userId, displayName).run();
+      .bind(platform, normalizedUserId, displayName).run();
     return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] addAccount error:', e.message);
@@ -125,11 +167,25 @@ export async function addAccount(db, platform, userId, displayName = '') {
 export async function removeAccount(db, platform, userId) {
   try {
     const cachePlatform = platform === 'instagram' ? 'ig' : 'xhs';
-    const result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND user_id = ?')
-      .bind(platform, userId).run();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    let result;
+
+    if (isCaseInsensitivePlatform(platform)) {
+      result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND LOWER(user_id) = ?')
+        .bind(platform, normalizedUserId).run();
+    } else {
+      result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND user_id = ?')
+        .bind(platform, normalizedUserId).run();
+    }
+
     await clearCachedPosts(db, cachePlatform, userId);
-    await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND user_id = ?')
-      .bind(cachePlatform, userId).run().catch(() => {});
+    if (isCaseInsensitivePlatform(cachePlatform)) {
+      await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND LOWER(user_id) = ?')
+        .bind(cachePlatform, normalizeUserId(cachePlatform, userId)).run().catch(() => {});
+    } else {
+      await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND user_id = ?')
+        .bind(cachePlatform, normalizeUserId(cachePlatform, userId)).run().catch(() => {});
+    }
     return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] removeAccount error:', e.message);
@@ -141,9 +197,12 @@ export async function removeAccount(db, platform, userId) {
 
 export async function getCachedPostIds(db, platform, userId) {
   try {
-    const { results } = await db.prepare(
-      'SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND user_id = ?'
-    ).bind(platform, userId).all();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ?')
+      : db.prepare('SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND user_id = ?');
+
+    const { results } = await stmt.bind(platform, normalizedUserId).all();
 
     const ids = new Set();
     for (const row of results || []) {
@@ -156,17 +215,24 @@ export async function getCachedPostIds(db, platform, userId) {
 
 export async function getCachedPosts(db, platform, userId, limit = 50) {
   try {
-    const { results } = await db.prepare(
-      'SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY date DESC, fetched_at DESC, id DESC LIMIT ?'
-    ).bind(platform, userId, limit).all();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('SELECT * FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ? ORDER BY date DESC, fetched_at DESC, id DESC LIMIT ?')
+      : db.prepare('SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY date DESC, fetched_at DESC, id DESC LIMIT ?');
+
+    const { results } = await stmt.bind(platform, normalizedUserId, limit).all();
     return results || [];
   } catch { return []; }
 }
 
 export async function clearCachedPosts(db, platform, userId) {
   try {
-    const result = await db.prepare('DELETE FROM posts_cache WHERE platform = ? AND user_id = ?')
-      .bind(platform, userId).run();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('DELETE FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ?')
+      : db.prepare('DELETE FROM posts_cache WHERE platform = ? AND user_id = ?');
+
+    const result = await stmt.bind(platform, normalizedUserId).run();
     return result.meta.changes || 0;
   } catch (e) {
     console.error('[db] clearCachedPosts error:', e.message);
@@ -176,9 +242,12 @@ export async function clearCachedPosts(db, platform, userId) {
 
 export async function dedupeCachedPosts(db, platform, userId) {
   try {
-    const { results } = await db.prepare(
-      'SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY fetched_at DESC, id DESC'
-    ).bind(platform, userId).all();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('SELECT * FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ? ORDER BY fetched_at DESC, id DESC')
+      : db.prepare('SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY fetched_at DESC, id DESC');
+
+    const { results } = await stmt.bind(platform, normalizedUserId).all();
 
     const rows = results || [];
     const keepByKey = new Map();
@@ -234,12 +303,22 @@ export async function cleanupCachedPosts(db, platform, userId, keepLimit = 100) 
   if (!keepLimit || keepLimit < 1) return 0;
 
   try {
-    const { results } = await db.prepare(
-      `SELECT id FROM posts_cache
-       WHERE platform = ? AND user_id = ?
-       ORDER BY date DESC, fetched_at DESC, id DESC
-       LIMIT -1 OFFSET ?`
-    ).bind(platform, userId, keepLimit).all();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare(
+        `SELECT id FROM posts_cache
+         WHERE platform = ? AND LOWER(user_id) = ?
+         ORDER BY date DESC, fetched_at DESC, id DESC
+         LIMIT -1 OFFSET ?`
+      )
+      : db.prepare(
+        `SELECT id FROM posts_cache
+         WHERE platform = ? AND user_id = ?
+         ORDER BY date DESC, fetched_at DESC, id DESC
+         LIMIT -1 OFFSET ?`
+      );
+
+    const { results } = await stmt.bind(platform, normalizedUserId, keepLimit).all();
 
     const staleRows = results || [];
     if (!staleRows.length) return 0;
@@ -254,15 +333,16 @@ export async function cleanupCachedPosts(db, platform, userId, keepLimit = 100) 
 
 export async function upsertPosts(db, platform, userId, posts, options = {}) {
   const keepLimit = Number.isFinite(options.keepLimit) ? options.keepLimit : 100;
+  const normalizedUserId = normalizeUserId(platform, userId);
   if (!posts || posts.length === 0) {
-    const dedupedCount = await dedupeCachedPosts(db, platform, userId);
-    const trimmedCount = await cleanupCachedPosts(db, platform, userId, keepLimit);
+    const dedupedCount = await dedupeCachedPosts(db, platform, normalizedUserId);
+    const trimmedCount = await cleanupCachedPosts(db, platform, normalizedUserId, keepLimit);
     return { total: 0, newCount: 0, dedupedCount, trimmedCount };
   }
 
   try {
-    const existingIds = await getCachedPostIds(db, platform, userId);
-    const preparedPosts = posts.map(post => enrichPostForStorage(platform, userId, post));
+    const existingIds = await getCachedPostIds(db, platform, normalizedUserId);
+    const preparedPosts = posts.map(post => enrichPostForStorage(platform, normalizedUserId, post));
     const newCount = preparedPosts.filter(p => !existingIds.has(p.id || p.post_id || '')).length;
 
     const stmt = db.prepare(
@@ -275,7 +355,7 @@ export async function upsertPosts(db, platform, userId, posts, options = {}) {
 
     const batch = preparedPosts.map(p => stmt.bind(
       platform,
-      userId,
+      normalizedUserId,
       p.id || p.post_id || '',
       p.canonical_id || '',
       p.content_hash || '',
@@ -290,8 +370,8 @@ export async function upsertPosts(db, platform, userId, posts, options = {}) {
 
     await db.batch(batch);
 
-    const dedupedCount = await dedupeCachedPosts(db, platform, userId);
-    const trimmedCount = await cleanupCachedPosts(db, platform, userId, keepLimit);
+    const dedupedCount = await dedupeCachedPosts(db, platform, normalizedUserId);
+    const trimmedCount = await cleanupCachedPosts(db, platform, normalizedUserId, keepLimit);
 
     return { total: preparedPosts.length, newCount, dedupedCount, trimmedCount };
   } catch (e) {
@@ -302,9 +382,12 @@ export async function upsertPosts(db, platform, userId, posts, options = {}) {
 
 export async function getLastFetchTime(db, platform, userId) {
   try {
-    const row = await db.prepare(
-      'SELECT fetched_at FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY fetched_at DESC LIMIT 1'
-    ).bind(platform, userId).first();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('SELECT fetched_at FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ? ORDER BY fetched_at DESC LIMIT 1')
+      : db.prepare('SELECT fetched_at FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY fetched_at DESC LIMIT 1');
+
+    const row = await stmt.bind(platform, normalizedUserId).first();
     return row?.fetched_at || null;
   } catch { return null; }
 }
@@ -320,9 +403,12 @@ export async function isCacheStale(db, platform, userId, ttlMinutes) {
 
 export async function getCrawlStatus(db, platform, userId) {
   try {
-    return await db.prepare(
-      'SELECT * FROM crawl_status WHERE platform = ? AND user_id = ?'
-    ).bind(platform, userId).first();
+    const normalizedUserId = normalizeUserId(platform, userId);
+    const stmt = isCaseInsensitivePlatform(platform)
+      ? db.prepare('SELECT * FROM crawl_status WHERE platform = ? AND LOWER(user_id) = ?')
+      : db.prepare('SELECT * FROM crawl_status WHERE platform = ? AND user_id = ?');
+
+    return await stmt.bind(platform, normalizedUserId).first();
   } catch { return null; }
 }
 
@@ -337,6 +423,7 @@ export async function getCrawlStatuses(db) {
 
 export async function markCrawlSuccess(db, platform, userId, status) {
   try {
+    const normalizedUserId = normalizeUserId(platform, userId);
     await db.prepare(
       `INSERT INTO crawl_status (
          platform, user_id, last_attempt_at, last_success_at, last_result,
@@ -360,7 +447,7 @@ export async function markCrawlSuccess(db, platform, userId, status) {
          updated_at = datetime('now')`
     ).bind(
       platform,
-      userId,
+      normalizedUserId,
       status.result || 'updated',
       status.postCount || 0,
       status.newCount || 0,
@@ -374,6 +461,7 @@ export async function markCrawlSuccess(db, platform, userId, status) {
 
 export async function markCrawlFailure(db, platform, userId, status) {
   try {
+    const normalizedUserId = normalizeUserId(platform, userId);
     await db.prepare(
       `INSERT INTO crawl_status (
          platform, user_id, last_attempt_at, last_success_at, last_result,
@@ -392,7 +480,7 @@ export async function markCrawlFailure(db, platform, userId, status) {
          updated_at = datetime('now')`
     ).bind(
       platform,
-      userId,
+      normalizedUserId,
       status.error || 'Unknown error',
       status.durationMs || 0
     ).run();
@@ -403,6 +491,7 @@ export async function markCrawlFailure(db, platform, userId, status) {
 
 export async function setFailureAlertCount(db, platform, userId, count) {
   try {
+    const normalizedUserId = normalizeUserId(platform, userId);
     await db.prepare(
       `INSERT INTO crawl_status (
          platform, user_id, last_attempt_at, last_success_at, last_result,
@@ -414,7 +503,7 @@ export async function setFailureAlertCount(db, platform, userId, count) {
        ON CONFLICT(platform, user_id) DO UPDATE SET
          last_alerted_failure_count = excluded.last_alerted_failure_count,
          updated_at = datetime('now')`
-    ).bind(platform, userId, count).run();
+    ).bind(platform, normalizedUserId, count).run();
   } catch (e) {
     console.error('[db] setFailureAlertCount error:', e.message);
   }
