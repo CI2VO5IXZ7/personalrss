@@ -7,19 +7,23 @@
 //   get_video_note_detail  → data.data[0]  直接是笔记对象 { note_id, title, desc, time, images_list[].url, video_info_v2 }
 
 import { trackApiCall } from '../db.js';
+import { escapeHtml } from '../html.js';
+import { logInfo, logWarn } from '../log.js';
 
 const TIKHUB_BASE = 'https://api.tikhub.io';
 const XHS_BASE = 'https://www.xiaohongshu.com';
 
-// ─── 获取用户笔记列表 ──────────────────────────────────────────────────────
-
-export async function fetchProfile(env, userId, existingIds = new Set()) {
+function getApiToken(env) {
   const token = env.TIKHUB_API_TOKEN;
   if (!token) {
     throw Object.assign(new Error('[xhs] TIKHUB_API_TOKEN not configured'), { code: 'NO_API_TOKEN' });
   }
+  return token;
+}
 
-  const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/get_user_posted_notes?user_id=${encodeURIComponent(userId)}&cursor=`;
+async function fetchTikhubJson(env, endpoint, query) {
+  const token = getApiToken(env);
+  const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?${query}`;
 
   const resp = await fetch(url, {
     headers: {
@@ -27,7 +31,8 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
       'Accept': 'application/json'
     }
   });
-  if (env.DB) await trackApiCall(env.DB, 'get_user_posted_notes').catch(() => {});
+
+  if (env.DB) await trackApiCall(env.DB, endpoint).catch(() => {});
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
@@ -39,11 +44,41 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
     throw new Error(`[xhs] TikHub API error: ${data.message || JSON.stringify(data).substring(0, 200)}`);
   }
 
-  // 实际结构: data.data.notes[]
-  const notes = data.data?.data?.notes || data.data?.notes || [];
-  if (!notes.length) return [];
+  return data;
+}
 
-  const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+async function fetchPostedNotes(env, userId) {
+  const data = await fetchTikhubJson(
+    env,
+    'get_user_posted_notes',
+    `user_id=${encodeURIComponent(userId)}&cursor=`
+  );
+
+  const notes = data.data?.data?.notes || data.data?.notes || [];
+  return { notes };
+}
+
+// ─── 获取用户笔记列表 ──────────────────────────────────────────────────────
+
+export async function fetchProfile(env, userId, existingIds = new Set()) {
+  const { notes } = await fetchPostedNotes(env, userId);
+  if (!notes.length) {
+    logInfo('xhs.fetch_profile', {
+      userId,
+      sourceCount: 0,
+      cachedCount: existingIds.size,
+      newFetchedCount: 0,
+      state: 'no_posts'
+    });
+    return {
+      posts: [],
+      meta: {
+        sourceCount: 0,
+        emptyReason: 'no_posts'
+      }
+    };
+  }
+
   const results = [];
 
   for (const note of notes) {
@@ -59,56 +94,75 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
     const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
 
     try {
-      const detailUrl = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
-      const detailResp = await fetch(detailUrl, { headers });
-      if (env.DB) await trackApiCall(env.DB, endpoint).catch(() => {});
-      if (detailResp.ok) {
-        const detailData = await detailResp.json();
-        if (detailData.code === 200 && detailData.data) {
-          const noteObj = extractNoteFromDetail(detailData.data, endpoint);
-          if (noteObj) {
-            const parsed = parseNote(noteObj, noteType);
-            // 强制使用列表 API 的 noteId，避免详情 API 返回不同 ID 导致重复
-            if (parsed) { parsed.id = noteId; parsed.link = `${XHS_BASE}/explore/${noteId}`; results.push(parsed); continue; }
+      const detailData = await fetchTikhubJson(env, endpoint, `note_id=${encodeURIComponent(noteId)}`);
+      if (detailData.data) {
+        const noteObj = extractNoteFromDetail(detailData.data, endpoint);
+        if (noteObj) {
+          const parsed = parseNote(noteObj, noteType, noteId);
+          if (parsed) {
+            results.push(parsed);
+            continue;
           }
         }
       }
     } catch (e) {
-      console.error(`[xhs] ${endpoint} for ${noteId} error: ${e.message}`);
+      logWarn('xhs.detail_fetch_failed', {
+        userId,
+        noteId,
+        noteType,
+        endpoint,
+        error: e
+      });
     }
 
     // 详情接口失败时回退到列表数据
-    const parsed = parseNoteFromList(note, userId);
+    const parsed = parseNoteFromList(note);
     if (parsed) results.push(parsed);
   }
 
-  console.log(`[xhs] ${userId}: ${notes.length} notes in list, ${existingIds.size} cached, ${results.length} new fetched`);
-  return results;
+  logInfo('xhs.fetch_profile', {
+    userId,
+    sourceCount: notes.length,
+    cachedCount: existingIds.size,
+    newFetchedCount: results.length,
+    state: results.length === 0 ? 'no_new_posts' : 'updated'
+  });
+
+  return {
+    posts: results,
+    meta: {
+      sourceCount: notes.length,
+      emptyReason: results.length === 0 ? 'no_new_posts' : ''
+    }
+  };
+}
+
+export async function validateProfile(env, userId) {
+  const { notes } = await fetchPostedNotes(env, userId);
+  return {
+    userId,
+    sourceCount: notes.length
+  };
 }
 
 // ─── 获取单条笔记详情（含完整图文）─────────────────────────────────────────
 
 export async function fetchNoteDetail(env, noteId, noteType) {
-  const token = env.TIKHUB_API_TOKEN;
-  if (!token) return null;
-
-  const headers = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
-
-  // 根据类型直接调用对应的详情接口
   const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
 
   try {
-    const url = `${TIKHUB_BASE}/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=${encodeURIComponent(noteId)}`;
-    const resp = await fetch(url, { headers });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    if (data.code !== 200 || !data.data) return null;
-
+    const data = await fetchTikhubJson(env, endpoint, `note_id=${encodeURIComponent(noteId)}`);
     const noteObj = extractNoteFromDetail(data.data, endpoint);
-    if (noteObj) return parseNote(noteObj, noteType);
+    if (noteObj) return parseNote(noteObj, noteType, noteId);
   } catch (e) {
-    console.error(`[xhs] ${endpoint} error: ${e.message}`);
+    logWarn('xhs.note_detail_failed', {
+      noteId,
+      noteType,
+      endpoint,
+      error: e
+    });
   }
+
   return null;
 }
 
@@ -140,43 +194,41 @@ function extractNoteFromDetail(apiData, endpoint) {
 
 // ─── 解析笔记列表项 (来自 get_user_posted_notes) ────────────────────────────
 
-function parseNoteFromList(note, userId) {
+function parseNoteFromList(note) {
   try {
-    // 字段: id, type, title, desc, create_time, images_list[].url, comments_count, share_count
     const noteId = note.id || note.note_id || '';
+    const noteType = note.type || 'normal';
     const title = note.title || '';
     const desc = note.desc || '';
 
-    // 图片: images_list[].url
     const imageList = extractImageUrls(note);
     const cover = imageList[0] || '';
+    const videoUrl = noteType === 'video' ? extractVideoUrl(note) : '';
 
-    // 时间: create_time (秒级 unix timestamp)
     const date = parseTimestamp(note.create_time || note.time) || parseObjectIdDate(noteId) || new Date().toISOString();
-
-    const link = `${XHS_BASE}/explore/${noteId}`;
-    const description = buildDescription(desc, imageList, cover);
 
     return {
       id: noteId,
+      canonical_id: noteId,
       title: title || desc.substring(0, 80) || 'XHS 笔记',
-      description,
-      link,
+      description: buildDescription(desc, imageList, cover, videoUrl),
+      link: `${XHS_BASE}/explore/${noteId}`,
       image: cover,
       date,
-      raw_images: imageList
+      raw_images: imageList,
+      media_type: noteType === 'video' ? 'video' : 'image'
     };
   } catch (e) {
-    console.error('[xhs] parseNoteFromList error:', e.message);
+    logWarn('xhs.parse_list_failed', { error: e });
     return null;
   }
 }
 
 // ─── 解析笔记对象 (来自详情接口) ────────────────────────────────────────────
 
-function parseNote(noteObj, noteType) {
+function parseNote(noteObj, noteType, canonicalId = '') {
   try {
-    const noteId = noteObj.note_id || noteObj.id || '';
+    const noteId = canonicalId || noteObj.note_id || noteObj.id || '';
     const title = noteObj.title || '';
     const desc = noteObj.desc || '';
 
@@ -188,20 +240,19 @@ function parseNote(noteObj, noteType) {
                || parseObjectIdDate(noteId)
                || new Date().toISOString();
 
-    const link = `${XHS_BASE}/explore/${noteId}`;
-    const description = buildDescription(desc, imageList, cover, videoUrl);
-
     return {
       id: noteId,
+      canonical_id: noteId,
       title: title || desc.substring(0, 80) || 'XHS 笔记',
-      description,
-      link,
+      description: buildDescription(desc, imageList, cover, videoUrl),
+      link: `${XHS_BASE}/explore/${noteId}`,
       image: cover,
       date,
-      raw_images: imageList
+      raw_images: imageList,
+      media_type: noteType === 'video' ? 'video' : 'image'
     };
   } catch (e) {
-    console.error('[xhs] parseNote error:', e.message);
+    logWarn('xhs.parse_detail_failed', { error: e });
     return null;
   }
 }
@@ -307,7 +358,7 @@ function buildDescription(desc, imageList, fallbackCover, videoUrl) {
   }
 
   if (desc) {
-    html += `<p>${desc.replace(/\n/g, '<br/>')}</p>`;
+    html += `<p>${escapeHtml(desc).replace(/\n/g, '<br/>')}</p>`;
   }
 
   return html || '<p>（无内容）</p>';

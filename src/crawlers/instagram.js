@@ -1,5 +1,7 @@
 // Instagram 抓取 — 使用官方内部 API（无需登录，CF 网络可直达公开 profile）
 
+import { escapeHtml } from '../html.js';
+
 const IG_BASE = 'https://www.instagram.com';
 const IG_APP_ID = '936619743392459';
 
@@ -27,7 +29,20 @@ function buildPostDescription(node) {
       : `<img src="${node.display_url}" style="max-width:100%">`;
 
   const caption = node.edge_media_to_caption?.edges?.[0]?.node?.text || '';
-  return caption ? `${media}<br><p>${caption.replace(/\n/g, '<br>')}</p>` : media;
+  return caption ? `${media}<br><p>${escapeHtml(caption).replace(/\n/g, '<br>')}</p>` : media;
+}
+
+function mapNodeToPost(username, node) {
+  return {
+    id: node.id,
+    title: (node.edge_media_to_caption?.edges?.[0]?.node?.text || '').split('\n')[0].substring(0, 100) || `@${username} post`,
+    description: buildPostDescription(node),
+    link: `https://www.instagram.com/p/${node.shortcode}/`,
+    image: node.display_url || node.thumbnail_src || '',
+    date: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString() : new Date().toISOString(),
+    canonical_id: node.id,
+    media_type: node.is_video ? 'video' : 'image'
+  };
 }
 
 export async function fetchProfile(username) {
@@ -43,12 +58,16 @@ export async function fetchProfile(username) {
   if (!user) throw new Error('No user data in Instagram API response');
 
   const edges = user.edge_owner_to_timeline_media?.edges || [];
-  return edges.map(({ node }) => ({
-    id: node.id,
-    title: (node.edge_media_to_caption?.edges?.[0]?.node?.text || '').split('\n')[0].substring(0, 100) || `@${username} post`,
-    description: buildPostDescription(node),
-    link: `https://www.instagram.com/p/${node.shortcode}/`,
-    image: node.display_url || node.thumbnail_src || '',
-    date: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString() : new Date().toISOString()
-  }));
+  return {
+    posts: edges.map(({ node }) => mapNodeToPost(username, node)),
+    meta: {
+      sourceCount: edges.length,
+      emptyReason: edges.length === 0 ? 'no_posts' : ''
+    }
+  };
+}
+
+export async function validateProfile(username) {
+  const { meta } = await fetchProfile(username);
+  return { username, sourceCount: meta.sourceCount };
 }

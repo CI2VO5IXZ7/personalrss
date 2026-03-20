@@ -1,56 +1,147 @@
-// 图片代理 — 代理 Instagram/XHS CDN 图片，解决签名过期和跨域问题
+// 图片与媒体代理
 
-// 允许代理的域名白名单
+import { logError, logWarn } from './log.js';
+
 const ALLOWED_HOSTS = [
-  'instagram.', 'cdninstagram.com', 'fbcdn.net',
-  'xhscdn.com', 'xiaohongshu.com', 'sns-img',
-  'xhscdn.net', 'sns-webpic', 'ci.xiaohongshu',
-  'sns-avatar', 'sns-video', 'xhs-cn'
+  'instagram.com',
+  'cdninstagram.com',
+  'fbcdn.net',
+  'xhscdn.com',
+  'xhscdn.net',
+  'xiaohongshu.com'
 ];
 
-function isAllowedUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return ALLOWED_HOSTS.some(h => parsed.hostname.includes(h));
-  } catch { return false; }
+const PASS_THROUGH_HEADERS = [
+  'content-length',
+  'content-range',
+  'accept-ranges',
+  'etag',
+  'last-modified'
+];
+
+function isAllowedHostname(hostname) {
+  return ALLOWED_HOSTS.some(allowed => hostname === allowed || hostname.endsWith(`.${allowed}`));
 }
 
-export async function handleImageProxy(c) {
-  const targetUrl = c.req.query('url');
-  if (!targetUrl) {
+function parseTargetUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    if (!isAllowedHostname(parsed.hostname)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyMediaUrl(url) {
+  try {
+    return /(\.mp4|\.mov|\.m4v|\.webm|\.m3u8)(\?|$)/i.test(url)
+      || /(?:^|\.)(?:sns-video)/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function buildReferer(targetUrl) {
+  return targetUrl.hostname.endsWith('instagram.com')
+    ? 'https://www.instagram.com/'
+    : 'https://www.xiaohongshu.com/';
+}
+
+function buildProxyHeaders(upstream, kind) {
+  const headers = new Headers();
+  headers.set('Content-Type', upstream.headers.get('content-type') || (kind === 'image' ? 'image/jpeg' : 'video/mp4'));
+  headers.set('Cache-Control', kind === 'image'
+    ? 'public, max-age=604800, stale-while-revalidate=86400'
+    : 'public, max-age=3600, stale-while-revalidate=86400');
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('X-Content-Type-Options', 'nosniff');
+
+  for (const key of PASS_THROUGH_HEADERS) {
+    const value = upstream.headers.get(key);
+    if (value) headers.set(key, value);
+  }
+
+  return headers;
+}
+
+function validateUpstreamContentType(kind, contentType, targetUrl) {
+  if (!contentType) return true;
+  if (kind === 'image') return contentType.startsWith('image/');
+  if (contentType.startsWith('video/')) return true;
+  if (contentType.includes('application/octet-stream')) return isLikelyMediaUrl(targetUrl.toString());
+  return false;
+}
+
+async function handleProxy(c, kind) {
+  const rawTargetUrl = c.req.query('url');
+  if (!rawTargetUrl) {
     return c.text('Missing ?url= parameter', 400);
   }
 
-  if (!isAllowedUrl(targetUrl)) {
+  const targetUrl = parseTargetUrl(rawTargetUrl);
+  if (!targetUrl) {
+    logWarn('proxy.target_rejected', { kind, targetUrl: rawTargetUrl });
     return c.text('URL domain not allowed', 403);
   }
 
   try {
-    const resp = await fetch(targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-        'Referer': targetUrl.includes('instagram') ? 'https://www.instagram.com/' : 'https://www.xiaohongshu.com/'
-      }
+    const headers = new Headers({
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': kind === 'image' ? 'image/*,*/*;q=0.8' : 'video/*,*/*;q=0.8',
+      'Referer': buildReferer(targetUrl)
+    });
+
+    if (kind === 'media') {
+      const range = c.req.raw.headers.get('Range');
+      if (range) headers.set('Range', range);
+    }
+
+    const resp = await fetch(targetUrl.toString(), {
+      headers,
+      redirect: 'follow'
     });
 
     if (!resp.ok) {
+      logWarn('proxy.upstream_error', {
+        kind,
+        status: resp.status,
+        targetUrl: targetUrl.toString()
+      });
       return c.text(`Upstream ${resp.status}`, resp.status);
     }
 
-    const contentType = resp.headers.get('content-type') || 'image/jpeg';
-    const body = await resp.arrayBuffer();
+    const contentType = resp.headers.get('content-type') || '';
+    if (!validateUpstreamContentType(kind, contentType, targetUrl)) {
+      logWarn('proxy.unexpected_content_type', {
+        kind,
+        contentType,
+        targetUrl: targetUrl.toString()
+      });
+      return c.text('Unexpected upstream content type', 415);
+    }
 
-    return new Response(body, {
-      headers: {
-        'Content-Type': contentType,
-        'Cache-Control': 'public, max-age=604800, immutable',
-        'Access-Control-Allow-Origin': '*'
-      }
+    return new Response(resp.body, {
+      status: resp.status,
+      headers: buildProxyHeaders(resp, kind)
     });
   } catch (e) {
+    logError('proxy.fetch_failed', {
+      kind,
+      targetUrl: targetUrl.toString(),
+      error: e
+    });
     return c.text(`Proxy error: ${e.message}`, 502);
   }
+}
+
+export function handleImageProxy(c) {
+  return handleProxy(c, 'image');
+}
+
+export function handleMediaProxy(c) {
+  return handleProxy(c, 'media');
 }
 
 // 将原始图片 URL 替换为代理 URL
@@ -59,15 +150,25 @@ export function proxyImageUrl(originalUrl, baseUrl) {
   return `${baseUrl}/img?url=${encodeURIComponent(originalUrl)}`;
 }
 
-// 替换 HTML 内容中的所有图片 URL 为代理 URL
-export function proxyHtmlImages(html, baseUrl) {
-  if (!html) return html;
-  // 替换 <img src="..."> 和 <video poster="..."> 中的图片 URL
-  return html.replace(
-    /((?:src|poster)=")([^"]+(?:instagram|cdninstagram|fbcdn|xhscdn|xiaohongshu|sns-img)[^"]*")/g,
-    (match, prefix, urlAndQuote) => {
-      const url = urlAndQuote.slice(0, -1); // 去掉末尾引号
-      return `${prefix}${baseUrl}/img?url=${encodeURIComponent(url)}"`;
-    }
-  );
+export function proxyMediaUrl(originalUrl, baseUrl) {
+  if (!originalUrl) return '';
+  return `${baseUrl}/media?url=${encodeURIComponent(originalUrl)}`;
 }
+
+// 替换 HTML 内容中的媒体 URL 为代理 URL
+export function proxyHtmlAssets(html, baseUrl) {
+  if (!html) return html;
+
+  return html.replace(/\b(src|poster)="([^"]+)"/gi, (match, attr, url) => {
+    const parsed = parseTargetUrl(url);
+    if (!parsed) return match;
+
+    const proxied = attr.toLowerCase() === 'poster' || !isLikelyMediaUrl(parsed.toString())
+      ? proxyImageUrl(parsed.toString(), baseUrl)
+      : proxyMediaUrl(parsed.toString(), baseUrl);
+
+    return `${attr}="${proxied}"`;
+  });
+}
+
+export const proxyHtmlImages = proxyHtmlAssets;

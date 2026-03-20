@@ -1,6 +1,31 @@
 // Telegram Bot API helpers
 
+import { escapeHtml } from './html.js';
+import { logError } from './log.js';
+
 const TG_API = 'https://api.telegram.org/bot';
+
+async function parseTelegramResponse(resp, action) {
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch {
+    logError('telegram.response_parse_failed', { action, status: resp.status });
+    throw new Error(`Telegram ${action} returned a non-JSON response`);
+  }
+
+  if (!resp.ok || !data?.ok) {
+    const description = data?.description || `Telegram ${action} HTTP ${resp.status}`;
+    logError('telegram.request_failed', {
+      action,
+      status: resp.status,
+      description
+    });
+    throw new Error(description);
+  }
+
+  return data;
+}
 
 export async function sendMessage(token, chatId, text, parseMode = 'HTML') {
   const resp = await fetch(`${TG_API}${token}/sendMessage`, {
@@ -13,7 +38,7 @@ export async function sendMessage(token, chatId, text, parseMode = 'HTML') {
       disable_web_page_preview: true
     })
   });
-  return resp.json();
+  return parseTelegramResponse(resp, 'sendMessage');
 }
 
 export async function sendPhoto(token, chatId, photoBytes, caption = '') {
@@ -28,7 +53,7 @@ export async function sendPhoto(token, chatId, photoBytes, caption = '') {
     method: 'POST',
     body: form
   });
-  return resp.json();
+  return parseTelegramResponse(resp, 'sendPhoto');
 }
 
 export async function setWebhook(token, url, secretToken = '') {
@@ -39,7 +64,7 @@ export async function setWebhook(token, url, secretToken = '') {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  return resp.json();
+  return parseTelegramResponse(resp, 'setWebhook');
 }
 
 export function verifyWebhookSecret(request, expectedSecret) {
@@ -54,3 +79,5 @@ export function parseCommand(text) {
   const cmd = parts[0].replace('/', '').replace(/@.*$/, '').toLowerCase();
   return { cmd, args: parts.slice(1) };
 }
+
+export { escapeHtml };

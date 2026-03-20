@@ -1,6 +1,7 @@
-// RSS 2.0 XML 生成 — 含图片代理 URL 替换
+// RSS 2.0 XML 生成 — 含媒体代理 URL 替换
 
-import { proxyImageUrl, proxyHtmlImages } from './proxy.js';
+import { escapeHtml, stripHtml } from './html.js';
+import { proxyImageUrl, proxyHtmlAssets } from './proxy.js';
 
 // 将日期格式化为 RFC 822 北京时间（+0800）
 function toBeijingRFC822(date) {
@@ -24,11 +25,12 @@ function buildItemsXml(items, baseUrl) {
     const date = item.date ? new Date(item.date) : new Date();
     const validDate = isNaN(date.getTime()) ? new Date() : date;
 
-    // 将 description 中的图片 URL 替换为代理 URL
-    const description = proxyHtmlImages(
+    const content = proxyHtmlAssets(
       item.description || buildDefaultDesc(item),
       baseUrl
     );
+
+    const summary = buildSummary(item.description || content);
 
     // enclosure 图片也走代理
     const proxyImg = item.image ? proxyImageUrl(item.image, baseUrl) : '';
@@ -38,11 +40,16 @@ function buildItemsXml(items, baseUrl) {
       <link>${escapeXml(item.link || '')}</link>
       <guid isPermaLink="false">${escapeXml(item.id || item.link || '')}</guid>
       <pubDate>${toBeijingRFC822(validDate)}</pubDate>
-      <description><![CDATA[${description}]]></description>
-      <content:encoded><![CDATA[${description}]]></content:encoded>
+      <description>${escapeXml(summary)}</description>
+      <content:encoded><![CDATA[${content}]]></content:encoded>
       ${proxyImg ? `<enclosure url="${escapeXml(proxyImg)}" type="image/jpeg" length="0"/>` : ''}
     </item>`;
   }).join('\n');
+}
+
+function buildSummary(content) {
+  const summary = stripHtml(content || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  return summary || '媒体内容';
 }
 
 function buildDefaultDesc(post) {
@@ -56,7 +63,7 @@ function buildDefaultDesc(post) {
   } else if (post.image) {
     html += `<p><img src="${post.image}" style="max-width:100%"/></p>`;
   }
-  if (post.description) html += `<p>${post.description.replace(/\n/g, '<br/>')}</p>`;
+  if (post.description) html += `<p>${escapeHtml(post.description).replace(/\n/g, '<br/>')}</p>`;
   return html || '<p>（无内容）</p>';
 }
 

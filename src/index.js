@@ -3,13 +3,17 @@ import {
   getAccounts, getAccountsByPlatform, getAccount,
   addAccount, removeAccount,
   getCachedPosts, getCachedPostIds, upsertPosts, isCacheStale, rowToPost,
-  getApiUsage, getApiUsageSummary
+  getApiUsage, getApiUsageSummary,
+  clearCachedPosts, getCrawlStatuses, getCrawlStatus,
+  markCrawlSuccess, markCrawlFailure,
+  getSetting, setSetting, setFailureAlertCount
 } from './db.js';
 import { generateInstagramFeed, generateXhsFeed } from './rss.js';
-import { sendMessage, setWebhook, parseCommand, verifyWebhookSecret } from './telegram.js';
-import { handleImageProxy } from './proxy.js';
-import { fetchProfile as fetchIg } from './crawlers/instagram.js';
-import { fetchProfile as fetchXhs } from './crawlers/xhs_tikhub.js';
+import { sendMessage, setWebhook, parseCommand, verifyWebhookSecret, escapeHtml } from './telegram.js';
+import { handleImageProxy, handleMediaProxy } from './proxy.js';
+import { fetchProfile as fetchIg, validateProfile as validateIg } from './crawlers/instagram.js';
+import { fetchProfile as fetchXhs, validateProfile as validateXhs } from './crawlers/xhs_tikhub.js';
+import { logError, logInfo, logWarn } from './log.js';
 
 const app = new Hono();
 
@@ -23,6 +27,22 @@ function cacheTtl(env) {
   return parseInt(env.CACHE_TTL_MINUTES || '60', 10);
 }
 
+function cachePostLimit(env) {
+  return parseInt(env.CACHE_MAX_POSTS || '100', 10);
+}
+
+function refreshConcurrency(env) {
+  return Math.max(1, parseInt(env.REFRESH_CONCURRENCY || '3', 10));
+}
+
+function failureAlertThreshold(env) {
+  return Math.max(1, parseInt(env.FAILURE_ALERT_THRESHOLD || '3', 10));
+}
+
+function apiUsageAlertThreshold(env) {
+  return Math.max(0, parseInt(env.API_USAGE_ALERT_THRESHOLD || '500', 10));
+}
+
 function rssResponse(xml) {
   return new Response(xml, {
     headers: {
@@ -32,49 +52,332 @@ function rssResponse(xml) {
   });
 }
 
-// ─── 首页 ─────────────────────────────────────────────────────────────────────
+function getAdminTokenFromRequest(c) {
+  const header = c.req.header('Authorization') || '';
+  if (header.startsWith('Bearer ')) return header.slice(7).trim();
+  return header.trim();
+}
 
-app.get('/', async c => {
-  const db = c.env.DB;
-  const accounts = await getAccounts(db);
-  const baseUrl = getBaseUrl(c.env, c.req.raw);
-  const feeds = accounts.map(a => ({
-    platform: a.platform === 'instagram' ? 'Instagram' : '小红书',
-    icon: a.platform === 'instagram' ? '📸' : '🍠',
-    name: a.display_name || a.user_id,
-    userId: a.user_id,
-    rssUrl: a.platform === 'instagram'
-      ? `${baseUrl}/rss/ig/${a.user_id}`
-      : `${baseUrl}/rss/xhs/${a.user_id}`,
-    profileUrl: a.platform === 'instagram'
-      ? `https://www.instagram.com/${a.user_id}/`
-      : `https://www.xiaohongshu.com/user/profile/${a.user_id}`
-  }));
+function requireAdmin(c) {
+  const expected = c.env.ADMIN_TOKEN || '';
+  const actual = getAdminTokenFromRequest(c);
+  if (!expected || actual !== expected) {
+    logWarn('admin.auth_failed', {
+      path: c.req.path,
+      method: c.req.method
+    });
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  return null;
+}
 
-  const todaySummary = await getApiUsageSummary(db, 1);
-  const todayCalls = todaySummary[0]?.total_calls || 0;
+function toAccountPlatform(cachePlatform) {
+  return cachePlatform === 'ig' ? 'instagram' : 'xiaohongshu';
+}
 
-  const html = buildHomePage(feeds, todayCalls);
-  return c.html(html);
-});
+function platformLabel(platform) {
+  return platform === 'ig' || platform === 'instagram' ? 'IG' : 'XHS';
+}
 
-// ─── 状态 ─────────────────────────────────────────────────────────────────────
+function truncate(value, max = 120) {
+  if (!value) return '';
+  return value.length > max ? `${value.slice(0, max - 3)}...` : value;
+}
 
-app.get('/status', async c => {
-  const db = c.env.DB;
+function describeRefreshState(result) {
+  if (!result.ok) return `❌ ${platformLabel(result.platform)} ${escapeHtml(result.id)}: ${escapeHtml(result.error)}`;
+  if (result.state === 'no_posts') {
+    return `ℹ️ ${platformLabel(result.platform)} ${escapeHtml(result.id)}: 账号暂无内容`;
+  }
+  if (result.state === 'no_new_posts') {
+    return `ℹ️ ${platformLabel(result.platform)} ${escapeHtml(result.id)}: 无新更新`;
+  }
+  return `✅ ${platformLabel(result.platform)} ${escapeHtml(result.id)}: ${result.newCount} 条新增，${result.dedupedCount || 0} 条去重，${result.trimmedCount || 0} 条裁剪`;
+}
+
+async function sendAdminAlert(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  try {
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, text);
+  } catch (e) {
+    logError('alert.send_failed', { error: e });
+  }
+}
+
+async function maybeSendMissingXhsTokenAlert(env) {
+  if (env.__xhsMissingTokenAlerted) return;
+  env.__xhsMissingTokenAlerted = true;
+  await sendAdminAlert(env, '⚠️ <b>TIKHUB_API_TOKEN 未配置</b>\n\n小红书数据无法刷新。');
+}
+
+async function maybeSendFailureAlert(env, status) {
+  if (!status) return;
+
+  const threshold = failureAlertThreshold(env);
+  const currentFailures = status.consecutive_failures || 0;
+  const lastAlerted = status.last_alerted_failure_count || 0;
+
+  if (currentFailures < threshold) return;
+  if (Math.floor(currentFailures / threshold) <= Math.floor(lastAlerted / threshold)) return;
+
+  await sendAdminAlert(
+    env,
+    `⚠️ <b>抓取连续失败告警</b>\n\n` +
+    `平台：${platformLabel(status.platform)}\n` +
+    `账号：<code>${escapeHtml(status.user_id)}</code>\n` +
+    `连续失败：<b>${currentFailures}</b> 次\n` +
+    `最近错误：${escapeHtml(truncate(status.last_error || '未知错误', 180))}`
+  );
+
+  await setFailureAlertCount(env.DB, status.platform, status.user_id, currentFailures);
+}
+
+async function maybeSendApiUsageAlert(env) {
+  const threshold = apiUsageAlertThreshold(env);
+  if (!threshold) return;
+
+  const summary = await getApiUsageSummary(env.DB, 1);
+  const today = summary[0];
+  if (!today?.date || (today.total_calls || 0) < threshold) return;
+
+  const key = `api_usage_alerted:${today.date}`;
+  const alreadyAlerted = await getSetting(env.DB, key);
+  if (alreadyAlerted === '1') return;
+
+  await sendAdminAlert(
+    env,
+    `⚠️ <b>TikHub API 调用量告警</b>\n\n` +
+    `日期：<b>${today.date}</b>\n` +
+    `调用量：<b>${today.total_calls}</b>\n` +
+    `阈值：<b>${threshold}</b>`
+  );
+
+  await setSetting(env.DB, key, '1');
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const size = Math.min(limit, items.length);
+
+  async function next() {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: size }, () => next()));
+  return results;
+}
+
+async function validateSubscription(env, platform, userId) {
+  if (platform === 'instagram') {
+    return validateIg(userId);
+  }
+  return validateXhs(env, userId);
+}
+
+async function refreshInstagramAccount(env, account) {
+  const db = env.DB;
+  const startedAt = Date.now();
+  const cachePlatform = 'ig';
+  const userId = account.user_id;
+
+  logInfo('refresh.account.start', { platform: cachePlatform, userId });
+
+  try {
+    const { posts, meta } = await fetchIg(userId);
+    const writeResult = await upsertPosts(db, cachePlatform, userId, posts, {
+      keepLimit: cachePostLimit(env)
+    });
+    const state = meta.sourceCount === 0 ? 'no_posts' : (writeResult.newCount > 0 ? 'updated' : 'no_new_posts');
+    const durationMs = Date.now() - startedAt;
+
+    await markCrawlSuccess(db, cachePlatform, userId, {
+      result: state,
+      postCount: meta.sourceCount,
+      newCount: writeResult.newCount,
+      emptyReason: state === 'updated' ? '' : state,
+      durationMs
+    });
+
+    const result = {
+      platform: cachePlatform,
+      id: userId,
+      ok: true,
+      state,
+      posts: meta.sourceCount,
+      newCount: writeResult.newCount,
+      dedupedCount: writeResult.dedupedCount,
+      trimmedCount: writeResult.trimmedCount,
+      durationMs
+    };
+
+    logInfo('refresh.account.success', result);
+    return result;
+  } catch (e) {
+    const durationMs = Date.now() - startedAt;
+    await markCrawlFailure(db, cachePlatform, userId, {
+      error: e.message,
+      durationMs
+    });
+    const status = await getCrawlStatus(db, cachePlatform, userId);
+    await maybeSendFailureAlert(env, status);
+
+    const result = {
+      platform: cachePlatform,
+      id: userId,
+      ok: false,
+      state: 'error',
+      error: e.message,
+      durationMs
+    };
+
+    logError('refresh.account.failed', result);
+    return result;
+  }
+}
+
+async function refreshXhsAccount(env, account) {
+  const db = env.DB;
+  const startedAt = Date.now();
+  const cachePlatform = 'xhs';
+  const userId = account.user_id;
+
+  logInfo('refresh.account.start', { platform: cachePlatform, userId });
+
+  try {
+    const existingIds = await getCachedPostIds(db, cachePlatform, userId);
+    const { posts, meta } = await fetchXhs(env, userId, existingIds);
+    const writeResult = await upsertPosts(db, cachePlatform, userId, posts, {
+      keepLimit: cachePostLimit(env)
+    });
+    const state = meta.sourceCount === 0 ? 'no_posts' : (writeResult.newCount > 0 ? 'updated' : 'no_new_posts');
+    const durationMs = Date.now() - startedAt;
+
+    await markCrawlSuccess(db, cachePlatform, userId, {
+      result: state,
+      postCount: meta.sourceCount,
+      newCount: writeResult.newCount,
+      emptyReason: state === 'updated' ? '' : state,
+      durationMs
+    });
+
+    const result = {
+      platform: cachePlatform,
+      id: userId,
+      ok: true,
+      state,
+      posts: meta.sourceCount,
+      newCount: writeResult.newCount,
+      dedupedCount: writeResult.dedupedCount,
+      trimmedCount: writeResult.trimmedCount,
+      durationMs
+    };
+
+    logInfo('refresh.account.success', result);
+    return result;
+  } catch (e) {
+    const durationMs = Date.now() - startedAt;
+    await markCrawlFailure(db, cachePlatform, userId, {
+      error: e.message,
+      durationMs
+    });
+    const status = await getCrawlStatus(db, cachePlatform, userId);
+    await maybeSendFailureAlert(env, status);
+
+    if (e.code === 'NO_API_TOKEN') {
+      await maybeSendMissingXhsTokenAlert(env);
+    }
+
+    const result = {
+      platform: cachePlatform,
+      id: userId,
+      ok: false,
+      state: 'error',
+      error: e.message,
+      durationMs
+    };
+
+    logError('refresh.account.failed', result);
+    return result;
+  }
+}
+
+async function refreshAccount(env, account) {
+  return account.platform === 'instagram'
+    ? refreshInstagramAccount(env, account)
+    : refreshXhsAccount(env, account);
+}
+
+async function refreshAllCaches(env) {
+  const db = env.DB;
   const igAccounts = await getAccountsByPlatform(db, 'instagram');
   const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
-  return c.json({
-    instagram: { accounts: igAccounts.length, method: 'Public API' },
-    xiaohongshu: { accounts: xhsAccounts.length, method: 'TikHub API' },
-    tikhub: { configured: !!c.env.TIKHUB_API_TOKEN },
-    worker: 'active'
-  });
-});
+  const tasks = [...igAccounts, ...xhsAccounts];
 
-// ─── 图片代理 ─────────────────────────────────────────────────────────────────
+  logInfo('refresh.batch.start', {
+    totalAccounts: tasks.length,
+    concurrency: refreshConcurrency(env)
+  });
+
+  const results = await runWithConcurrency(tasks, refreshConcurrency(env), account => refreshAccount(env, account));
+  await maybeSendApiUsageAlert(env);
+
+  logInfo('refresh.batch.finish', {
+    totalAccounts: tasks.length,
+    failures: results.filter(r => !r.ok).length
+  });
+
+  return results;
+}
+
+async function refreshSingleAccount(env, platform, userId) {
+  const account = await getAccount(env.DB, platform, userId);
+  if (!account) {
+    return null;
+  }
+  return refreshAccount(env, account);
+}
+
+async function purgeSingleAccount(env, cachePlatform, userId) {
+  const accountPlatform = toAccountPlatform(cachePlatform);
+  const account = await getAccount(env.DB, accountPlatform, userId);
+  if (!account) return null;
+
+  const removed = await clearCachedPosts(env.DB, cachePlatform, userId);
+  logInfo('cache.purged', { platform: cachePlatform, userId, removed });
+  return { platform: cachePlatform, id: userId, removed };
+}
+
+function formatStatusSummary(statuses) {
+  const counts = {
+    updated: 0,
+    no_new_posts: 0,
+    no_posts: 0,
+    error: 0
+  };
+
+  for (const status of statuses) {
+    const key = status.last_result || 'error';
+    if (key in counts) counts[key] += 1;
+  }
+
+  return counts;
+}
+
+// ─── Closed Public Pages ──────────────────────────────────────────────────────
+
+app.get('/', c => c.text('Not Found', 404));
+app.get('/status', c => c.text('Not Found', 404));
+
+// ─── Proxy ────────────────────────────────────────────────────────────────────
 
 app.get('/img', handleImageProxy);
+app.get('/media', handleMediaProxy);
 
 // ─── Instagram RSS（D1 缓存优先）──────────────────────────────────────────────
 
@@ -97,9 +400,13 @@ app.get('/rss/ig/:username', async c => {
 
   if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
-      fetchIg(username)
-        .then(newPosts => upsertPosts(db, 'ig', username, newPosts))
-        .catch(e => console.error(`[bg-ig] ${username}: ${e.message}`))
+      refreshInstagramAccount(c.env, account).catch(e => {
+        logError('rss.background_refresh_failed', {
+          platform: 'ig',
+          userId: username,
+          error: e
+        });
+      })
     );
   }
 
@@ -127,17 +434,13 @@ app.get('/rss/xhs/:userId', async c => {
 
   if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
-      getCachedPostIds(db, 'xhs', userId)
-        .then(existingIds => fetchXhs(c.env, userId, existingIds))
-        .then(newPosts => upsertPosts(db, 'xhs', userId, newPosts))
-        .catch(async e => {
-          console.error(`[bg-xhs] ${userId}: ${e.message}`);
-          if (e.code === 'NO_API_TOKEN') {
-            await sendMessage(c.env.TELEGRAM_BOT_TOKEN, c.env.TELEGRAM_CHAT_ID,
-              '⚠️ TIKHUB_API_TOKEN 未配置，小红书数据无法获取。'
-            ).catch(() => {});
-          }
-        })
+      refreshXhsAccount(c.env, account).catch(e => {
+        logError('rss.background_refresh_failed', {
+          platform: 'xhs',
+          userId,
+          error: e
+        });
+      })
     );
   }
 
@@ -146,10 +449,10 @@ app.get('/rss/xhs/:userId', async c => {
 
 // ─── Telegram Webhook 设置（部署后调用一次）──────────────────────────────────
 
-app.get('/setup-webhook', async c => {
-  if (!c.env.ADMIN_TOKEN || c.req.query('token') !== c.env.ADMIN_TOKEN) {
-    return c.json({ error: 'Unauthorized' }, 401);
-  }
+app.post('/setup-webhook', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
   const baseUrl = getBaseUrl(c.env, c.req.raw);
   const secretToken = c.env.ADMIN_TOKEN || '';
   const result = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
@@ -158,10 +461,10 @@ app.get('/setup-webhook', async c => {
 
 // ─── Admin: 手动刷新缓存 ─────────────────────────────────────────────────────
 
-app.get('/admin/refresh', async c => {
-  if (!c.env.ADMIN_TOKEN || c.req.query('token') !== c.env.ADMIN_TOKEN) {
-    return c.json({ error: 'Unauthorized' }, 401);
-  }
+app.post('/admin/refresh', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
   const results = await refreshAllCaches(c.env);
   return c.json({ refreshed: results });
 });
@@ -169,13 +472,17 @@ app.get('/admin/refresh', async c => {
 // ─── Telegram Webhook ─────────────────────────────────────────────────────────
 
 app.post('/telegram', async c => {
-  // 校验 Telegram Webhook Secret Token
   if (!verifyWebhookSecret(c.req.raw, c.env.ADMIN_TOKEN || '')) {
+    logWarn('telegram.webhook_secret_rejected', {});
     return c.text('ok');
   }
 
   let update;
-  try { update = await c.req.json(); } catch { return c.text('ok'); }
+  try {
+    update = await c.req.json();
+  } catch {
+    return c.text('ok');
+  }
 
   const msg = update.message;
   if (!msg?.text) return c.text('ok');
@@ -184,7 +491,10 @@ app.post('/telegram', async c => {
   const token = c.env.TELEGRAM_BOT_TOKEN;
   const allowedChat = c.env.TELEGRAM_CHAT_ID;
 
-  if (String(chatId) !== String(allowedChat)) return c.text('ok');
+  if (String(chatId) !== String(allowedChat)) {
+    logWarn('telegram.chat_rejected', { chatId });
+    return c.text('ok');
+  }
 
   const parsed = parseCommand(msg.text);
   if (!parsed) return c.text('ok');
@@ -198,310 +508,260 @@ app.post('/telegram', async c => {
 async function handleCommand({ cmd, args }, env, chatId, token) {
   const db = env.DB;
 
-  switch (cmd) {
-    case 'start':
-    case 'help':
-      await sendMessage(token, chatId,
-        '🤖 <b>Social RSS Bridge</b>\n\n' +
-        '<b>订阅管理：</b>\n' +
-        '/add_ig &lt;username&gt; [displayName] — 添加 IG 订阅\n' +
-        '/add_xhs &lt;userId&gt; [displayName] — 添加小红书订阅\n' +
-        '/remove_ig &lt;username&gt; — 删除 IG 订阅\n' +
-        '/remove_xhs &lt;userId&gt; — 删除小红书订阅\n' +
-        '/list — 列出所有订阅\n\n' +
-        '<b>其他：</b>\n' +
-        '/feeds — 列出 RSS 链接\n' +
-        '/status — 查看服务状态\n' +
-        '/api_usage [天数] — TikHub API 调用量\n' +
-        '/refresh — 立即刷新缓存\n' +
-        '/help — 显示此帮助');
-      break;
-
-    case 'add_ig': {
-      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_ig &lt;username&gt; [displayName]'); break; }
-      const username = args[0];
-      const displayName = args.slice(1).join(' ') || username;
-      const ok = await addAccount(db, 'instagram', username, displayName);
-      if (ok) {
-        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+  try {
+    switch (cmd) {
+      case 'start':
+      case 'help':
         await sendMessage(token, chatId,
-          `✅ 已添加 Instagram 订阅：<b>${displayName}</b>\n\n📡 RSS: <code>${baseUrl}/rss/ig/${username}</code>`);
-      } else {
-        await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：${username}`);
-      }
-      break;
-    }
-
-    case 'add_xhs': {
-      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_xhs &lt;userId&gt; [displayName]'); break; }
-      const userId = args[0];
-      const displayName = args.slice(1).join(' ') || userId;
-      const ok = await addAccount(db, 'xiaohongshu', userId, displayName);
-      if (ok) {
-        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
-        await sendMessage(token, chatId,
-          `✅ 已添加小红书订阅：<b>${displayName}</b>\n\n📡 RSS: <code>${baseUrl}/rss/xhs/${userId}</code>`);
-      } else {
-        await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：${userId}`);
-      }
-      break;
-    }
-
-    case 'remove_ig': {
-      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_ig &lt;username&gt;'); break; }
-      const ok = await removeAccount(db, 'instagram', args[0]);
-      await sendMessage(token, chatId, ok
-        ? `✅ 已删除 Instagram 订阅：${args[0]}`
-        : `⚠️ 未找到该订阅：${args[0]}`);
-      break;
-    }
-
-    case 'remove_xhs': {
-      if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_xhs &lt;userId&gt;'); break; }
-      const ok = await removeAccount(db, 'xiaohongshu', args[0]);
-      await sendMessage(token, chatId, ok
-        ? `✅ 已删除小红书订阅：${args[0]}`
-        : `⚠️ 未找到该订阅：${args[0]}`);
-      break;
-    }
-
-    case 'list': {
-      const accounts = await getAccounts(db);
-      if (accounts.length === 0) {
-        await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+          '🤖 <b>Social RSS Bridge</b>\n\n' +
+          '<b>订阅管理：</b>\n' +
+          '/add_ig &lt;username&gt; [displayName] — 添加 IG 订阅\n' +
+          '/add_xhs &lt;userId&gt; [displayName] — 添加小红书订阅\n' +
+          '/remove_ig &lt;username&gt; — 删除 IG 订阅\n' +
+          '/remove_xhs &lt;userId&gt; — 删除小红书订阅\n' +
+          '/list — 列出所有订阅\n\n' +
+          '<b>运维：</b>\n' +
+          '/feeds — 列出 RSS 链接\n' +
+          '/status — 查看服务状态\n' +
+          '/api_usage [天数] — TikHub API 调用量\n' +
+          '/refresh — 刷新全部缓存\n' +
+          '/refresh_ig &lt;username&gt; — 刷新单个 IG\n' +
+          '/refresh_xhs &lt;userId&gt; — 刷新单个小红书\n' +
+          '/purge_ig &lt;username&gt; — 清理单个 IG 缓存\n' +
+          '/purge_xhs &lt;userId&gt; — 清理单个小红书缓存\n' +
+          '/help — 显示此帮助');
         break;
-      }
-      let msg = '📋 <b>订阅列表</b>\n\n';
-      for (const a of accounts) {
-        const icon = a.platform === 'instagram' ? '📸' : '🍠';
-        const plat = a.platform === 'instagram' ? 'IG' : 'XHS';
-        msg += `${icon} [${plat}] <b>${a.display_name || a.user_id}</b>\n   ID: <code>${a.user_id}</code>\n\n`;
-      }
-      await sendMessage(token, chatId, msg);
-      break;
-    }
 
-    case 'feeds': {
-      const accounts = await getAccounts(db);
-      const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
-      if (accounts.length === 0) {
-        await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
-        break;
-      }
-      let msg = '📡 <b>RSS 订阅链接</b>\n\n';
-      for (const a of accounts) {
-        const icon = a.platform === 'instagram' ? '📸' : '🍠';
-        const path = a.platform === 'instagram' ? `rss/ig/${a.user_id}` : `rss/xhs/${a.user_id}`;
-        msg += `${icon} ${a.display_name || a.user_id}\n<code>${baseUrl}/${path}</code>\n\n`;
-      }
-      await sendMessage(token, chatId, msg);
-      break;
-    }
+      case 'add_ig': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_ig &lt;username&gt; [displayName]'); break; }
+        const username = args[0].trim().toLowerCase();
+        const displayName = args.slice(1).join(' ').trim() || username;
 
-    case 'status': {
-      const igAccounts = await getAccountsByPlatform(db, 'instagram');
-      const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
-      let msg = '📊 <b>服务状态</b>\n\n';
-      msg += `📸 Instagram：${igAccounts.length} 个订阅（公开 API）\n\n`;
-      msg += `🍠 小红书：${xhsAccounts.length} 个订阅（TikHub API）\n`;
-      msg += `   API Token: ${env.TIKHUB_API_TOKEN ? '✅ 已配置' : '❌ 未配置'}\n`;
-      await sendMessage(token, chatId, msg);
-      break;
-    }
+        await sendMessage(token, chatId, `🔎 正在校验 Instagram 账号 <code>${escapeHtml(username)}</code>...`);
+        const validation = await validateSubscription(env, 'instagram', username);
+        const ok = await addAccount(db, 'instagram', username, displayName);
 
-    case 'api_usage': {
-      const days = parseInt(args[0]) || 7;
-      const usage = await getApiUsage(db, days);
-      const summary = await getApiUsageSummary(db, days);
-      if (summary.length === 0) {
-        await sendMessage(token, chatId, '📊 暂无 API 调用记录。');
-        break;
-      }
-      let msg = `📊 <b>TikHub API 调用量（近 ${days} 天）</b>\n\n`;
-      for (const day of summary) {
-        msg += `📅 <b>${day.date}</b>：共 ${day.total_calls} 次\n`;
-        const dayDetails = usage.filter(u => u.date === day.date);
-        for (const d of dayDetails) {
-          msg += `   • ${d.endpoint}：${d.calls} 次\n`;
+        if (ok) {
+          const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+          await sendMessage(token, chatId,
+            `✅ 已添加 Instagram 订阅：<b>${escapeHtml(displayName)}</b>\n\n` +
+            `📡 RSS: <code>${baseUrl}/rss/ig/${escapeHtml(username)}</code>\n` +
+            `📦 当前可见帖子数：<b>${validation.sourceCount}</b>`);
+        } else {
+          await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：<code>${escapeHtml(username)}</code>`);
         }
-        msg += '\n';
+        break;
       }
-      const totalAll = summary.reduce((s, d) => s + d.total_calls, 0);
-      msg += `📈 合计：<b>${totalAll}</b> 次`;
-      await sendMessage(token, chatId, msg);
-      break;
-    }
 
-    case 'refresh':
-      await sendMessage(token, chatId, '🔄 正在刷新所有缓存...');
-      try {
+      case 'add_xhs': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_xhs &lt;userId&gt; [displayName]'); break; }
+        const userId = args[0].trim();
+        const displayName = args.slice(1).join(' ').trim() || userId;
+
+        await sendMessage(token, chatId, `🔎 正在校验小红书账号 <code>${escapeHtml(userId)}</code>...`);
+        const validation = await validateSubscription(env, 'xiaohongshu', userId);
+        const ok = await addAccount(db, 'xiaohongshu', userId, displayName);
+
+        if (ok) {
+          const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+          await sendMessage(token, chatId,
+            `✅ 已添加小红书订阅：<b>${escapeHtml(displayName)}</b>\n\n` +
+            `📡 RSS: <code>${baseUrl}/rss/xhs/${escapeHtml(userId)}</code>\n` +
+            `📦 当前可见笔记数：<b>${validation.sourceCount}</b>`);
+        } else {
+          await sendMessage(token, chatId, `⚠️ 添加失败（可能已存在）：<code>${escapeHtml(userId)}</code>`);
+        }
+        break;
+      }
+
+      case 'remove_ig': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_ig &lt;username&gt;'); break; }
+        const username = args[0].trim().toLowerCase();
+        const ok = await removeAccount(db, 'instagram', username);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已删除 Instagram 订阅：<code>${escapeHtml(username)}</code>`
+          : `⚠️ 未找到该订阅：<code>${escapeHtml(username)}</code>`);
+        break;
+      }
+
+      case 'remove_xhs': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_xhs &lt;userId&gt;'); break; }
+        const userId = args[0].trim();
+        const ok = await removeAccount(db, 'xiaohongshu', userId);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已删除小红书订阅：<code>${escapeHtml(userId)}</code>`
+          : `⚠️ 未找到该订阅：<code>${escapeHtml(userId)}</code>`);
+        break;
+      }
+
+      case 'list': {
+        const accounts = await getAccounts(db);
+        if (accounts.length === 0) {
+          await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+          break;
+        }
+        let msg = '📋 <b>订阅列表</b>\n\n';
+        for (const a of accounts) {
+          msg += `${platformLabel(a.platform)} <b>${escapeHtml(a.display_name || a.user_id)}</b>\n`;
+          msg += `ID: <code>${escapeHtml(a.user_id)}</code>\n\n`;
+        }
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'feeds': {
+        const accounts = await getAccounts(db);
+        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+        if (accounts.length === 0) {
+          await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
+          break;
+        }
+        let msg = '📡 <b>RSS 订阅链接</b>\n\n';
+        for (const a of accounts) {
+          const path = a.platform === 'instagram' ? `rss/ig/${a.user_id}` : `rss/xhs/${a.user_id}`;
+          msg += `${platformLabel(a.platform)} ${escapeHtml(a.display_name || a.user_id)}\n`;
+          msg += `<code>${baseUrl}/${escapeHtml(path)}</code>\n\n`;
+        }
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'status': {
+        const igAccounts = await getAccountsByPlatform(db, 'instagram');
+        const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
+        const statuses = await getCrawlStatuses(db);
+        const summary = formatStatusSummary(statuses);
+        const failures = statuses.filter(s => (s.consecutive_failures || 0) > 0)
+          .sort((a, b) => (b.consecutive_failures || 0) - (a.consecutive_failures || 0))
+          .slice(0, 5);
+
+        let msg = '📊 <b>服务状态</b>\n\n';
+        msg += `Instagram：<b>${igAccounts.length}</b> 个订阅\n`;
+        msg += `小红书：<b>${xhsAccounts.length}</b> 个订阅\n`;
+        msg += `TikHub Token：${env.TIKHUB_API_TOKEN ? '✅ 已配置' : '❌ 未配置'}\n`;
+
+        if (statuses.length > 0) {
+          msg += '\n<b>最近抓取结果</b>\n';
+          msg += `更新成功：${summary.updated}\n`;
+          msg += `无新更新：${summary.no_new_posts}\n`;
+          msg += `暂无内容：${summary.no_posts}\n`;
+          msg += `抓取失败：${summary.error}\n`;
+        }
+
+        if (failures.length > 0) {
+          msg += '\n<b>异常账号</b>\n';
+          for (const item of failures) {
+            msg += `${platformLabel(item.platform)} <code>${escapeHtml(item.user_id)}</code>: 连续失败 ${item.consecutive_failures} 次\n`;
+            if (item.last_error) {
+              msg += `${escapeHtml(truncate(item.last_error, 80))}\n`;
+            }
+          }
+        }
+
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'api_usage': {
+        const days = parseInt(args[0] || '7', 10) || 7;
+        const usage = await getApiUsage(db, days);
+        const summary = await getApiUsageSummary(db, days);
+        if (summary.length === 0) {
+          await sendMessage(token, chatId, '📊 暂无 API 调用记录。');
+          break;
+        }
+        let msg = `📊 <b>TikHub API 调用量（近 ${days} 天）</b>\n\n`;
+        for (const day of summary) {
+          msg += `📅 <b>${day.date}</b>：共 ${day.total_calls} 次\n`;
+          const dayDetails = usage.filter(u => u.date === day.date);
+          for (const detail of dayDetails) {
+            msg += `• ${escapeHtml(detail.endpoint)}：${detail.calls} 次\n`;
+          }
+          msg += '\n';
+        }
+        const totalAll = summary.reduce((sum, day) => sum + day.total_calls, 0);
+        msg += `📈 合计：<b>${totalAll}</b> 次`;
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'refresh': {
+        await sendMessage(token, chatId, '🔄 正在刷新全部缓存...');
         const results = await refreshAllCaches(env);
         const hasNew = results.some(r => r.ok && (r.newCount || 0) > 0);
         let msg = '✅ <b>缓存刷新完成</b>\n\n';
-        for (const r of results) {
-          if (!r.ok) {
-            msg += `❌ ${r.platform} ${r.id}: ${r.error}\n`;
-          } else if ((r.newCount || 0) > 0) {
-            msg += `✅ ${r.platform} ${r.id}: ${r.posts} 条新内容\n`;
-          } else {
-            msg += `ℹ️ ${r.platform} ${r.id}: 无新更新\n`;
-          }
-        }
+        msg += results.map(describeRefreshState).join('\n');
         if (!hasNew && results.every(r => r.ok)) {
-          msg += '\n📭 所有订阅均无新更新。';
+          msg += '\n\n📭 所有订阅均无新更新。';
         }
         await sendMessage(token, chatId, msg);
-      } catch (e) {
-        await sendMessage(token, chatId, `❌ 刷新失败：${e.message}`);
+        break;
       }
-      break;
 
-    default:
-      await sendMessage(token, chatId, `未知命令 /${cmd}，发送 /help 查看可用命令。`);
-  }
-}
-
-// ─── 缓存刷新（Cron + 手动共用）──────────────────────────────────────────────
-
-async function refreshAllCaches(env) {
-  console.log('[cron] Starting cache refresh...');
-  const db = env.DB;
-  const results = [];
-
-  const igAccounts = await getAccountsByPlatform(db, 'instagram');
-  for (const a of igAccounts) {
-    try {
-      const newPosts = await fetchIg(a.user_id);
-      const { newCount } = await upsertPosts(db, 'ig', a.user_id, newPosts);
-      results.push({ platform: 'ig', id: a.user_id, posts: newPosts.length, newCount, ok: true });
-      console.log(`[cron] IG @${a.user_id}: ${newPosts.length} posts, ${newCount} new`);
-    } catch (e) {
-      results.push({ platform: 'ig', id: a.user_id, ok: false, error: e.message });
-      console.error(`[cron] IG @${a.user_id} failed: ${e.message}`);
-    }
-  }
-
-  const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
-  let xhsApiAlerted = false;
-  for (const a of xhsAccounts) {
-    try {
-      const existingIds = await getCachedPostIds(db, 'xhs', a.user_id);
-      const newPosts = await fetchXhs(env, a.user_id, existingIds);
-      const { newCount } = await upsertPosts(db, 'xhs', a.user_id, newPosts);
-      results.push({ platform: 'xhs', id: a.user_id, posts: newPosts.length, newCount, ok: true });
-      console.log(`[cron] XHS ${a.user_id}: ${newPosts.length} new posts fetched, ${newCount} actually new`);
-    } catch (e) {
-      results.push({ platform: 'xhs', id: a.user_id, ok: false, error: e.message });
-      console.error(`[cron] XHS ${a.user_id} failed: ${e.message}`);
-      if (!xhsApiAlerted && e.code === 'NO_API_TOKEN') {
-        xhsApiAlerted = true;
-        await sendMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID,
-          '⚠️ TIKHUB_API_TOKEN 未配置，小红书数据无法获取。'
-        ).catch(() => {});
+      case 'refresh_ig': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/refresh_ig &lt;username&gt;'); break; }
+        const username = args[0].trim().toLowerCase();
+        await sendMessage(token, chatId, `🔄 正在刷新 IG <code>${escapeHtml(username)}</code>...`);
+        const result = await refreshSingleAccount(env, 'instagram', username);
+        if (!result) {
+          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(username)}</code>`);
+          break;
+        }
+        await sendMessage(token, chatId, describeRefreshState(result));
+        break;
       }
+
+      case 'refresh_xhs': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/refresh_xhs &lt;userId&gt;'); break; }
+        const userId = args[0].trim();
+        await sendMessage(token, chatId, `🔄 正在刷新小红书 <code>${escapeHtml(userId)}</code>...`);
+        const result = await refreshSingleAccount(env, 'xiaohongshu', userId);
+        if (!result) {
+          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(userId)}</code>`);
+          break;
+        }
+        await sendMessage(token, chatId, describeRefreshState(result));
+        break;
+      }
+
+      case 'purge_ig': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/purge_ig &lt;username&gt;'); break; }
+        const username = args[0].trim().toLowerCase();
+        const result = await purgeSingleAccount(env, 'ig', username);
+        if (!result) {
+          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(username)}</code>`);
+          break;
+        }
+        await sendMessage(token, chatId,
+          `🧹 已清理 IG 缓存：<code>${escapeHtml(username)}</code>\n` +
+          `删除条数：<b>${result.removed}</b>`);
+        break;
+      }
+
+      case 'purge_xhs': {
+        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/purge_xhs &lt;userId&gt;'); break; }
+        const userId = args[0].trim();
+        const result = await purgeSingleAccount(env, 'xhs', userId);
+        if (!result) {
+          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(userId)}</code>`);
+          break;
+        }
+        await sendMessage(token, chatId,
+          `🧹 已清理小红书缓存：<code>${escapeHtml(userId)}</code>\n` +
+          `删除条数：<b>${result.removed}</b>`);
+        break;
+      }
+
+      default:
+        await sendMessage(token, chatId, `未知命令 /${escapeHtml(cmd)}，发送 /help 查看可用命令。`);
     }
+  } catch (e) {
+    logError('telegram.command_failed', {
+      cmd,
+      error: e
+    });
+    await sendMessage(token, chatId, `❌ 命令执行失败：${escapeHtml(e.message)}`).catch(() => {});
   }
-
-  return results;
-}
-
-// ─── 首页 HTML 生成 ──────────────────────────────────────────────────────────
-
-function buildHomePage(feeds, todayCalls) {
-  const feedCards = feeds.map(f => `
-      <div class="card">
-        <div class="card-header">
-          <span class="icon">${f.icon}</span>
-          <div>
-            <div class="card-title">${esc(f.name)}</div>
-            <div class="card-platform">${esc(f.platform)}</div>
-          </div>
-        </div>
-        <div class="card-links">
-          <a href="${esc(f.rssUrl)}" class="btn btn-rss" title="RSS 订阅">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
-            RSS
-          </a>
-          <a href="${esc(f.profileUrl)}" class="btn btn-profile" target="_blank" rel="noopener">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-            主页
-          </a>
-        </div>
-      </div>`).join('\n');
-
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Social RSS Bridge</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-    background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;color:#e0e0e0}
-  .container{max-width:720px;margin:0 auto;padding:40px 20px}
-  .header{text-align:center;margin-bottom:40px}
-  .header h1{font-size:2rem;font-weight:700;background:linear-gradient(90deg,#f093fb,#f5576c,#fda085);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
-  .header p{color:#9e9eb8;font-size:0.95rem}
-  .stats{display:flex;justify-content:center;gap:24px;margin:24px 0}
-  .stat{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);
-    border-radius:12px;padding:16px 28px;text-align:center;backdrop-filter:blur(8px)}
-  .stat-value{font-size:1.8rem;font-weight:700;color:#f5576c}
-  .stat-label{font-size:0.8rem;color:#9e9eb8;margin-top:4px}
-  .section-title{font-size:1.1rem;font-weight:600;color:#c0b8e8;margin:32px 0 16px;
-    display:flex;align-items:center;gap:8px}
-  .card{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);
-    border-radius:14px;padding:20px;margin-bottom:12px;
-    transition:transform .2s,border-color .2s;backdrop-filter:blur(8px)}
-  .card:hover{transform:translateY(-2px);border-color:rgba(245,87,108,0.3)}
-  .card-header{display:flex;align-items:center;gap:14px;margin-bottom:14px}
-  .icon{font-size:2rem;width:48px;height:48px;display:flex;align-items:center;justify-content:center;
-    background:rgba(255,255,255,0.08);border-radius:12px}
-  .card-title{font-size:1.05rem;font-weight:600;color:#f0eef6}
-  .card-platform{font-size:0.82rem;color:#8e8ea8;margin-top:2px}
-  .card-links{display:flex;gap:10px}
-  .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;
-    font-size:0.82rem;font-weight:500;text-decoration:none;transition:all .2s}
-  .btn-rss{background:rgba(245,87,108,0.15);color:#f5576c;border:1px solid rgba(245,87,108,0.25)}
-  .btn-rss:hover{background:rgba(245,87,108,0.25)}
-  .btn-profile{background:rgba(160,140,255,0.12);color:#a08cff;border:1px solid rgba(160,140,255,0.2)}
-  .btn-profile:hover{background:rgba(160,140,255,0.22)}
-  .footer{text-align:center;margin-top:48px;color:#6e6e88;font-size:0.8rem}
-  .empty{text-align:center;padding:40px;color:#8e8ea8}
-  @media(max-width:480px){.container{padding:24px 16px}.header h1{font-size:1.5rem}
-    .stats{flex-direction:column;align-items:center;gap:12px}}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>Social RSS Bridge</h1>
-    <p>将社交媒体转换为 RSS 订阅源</p>
-  </div>
-  <div class="stats">
-    <div class="stat">
-      <div class="stat-value">${feeds.length}</div>
-      <div class="stat-label">订阅源</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">${todayCalls}</div>
-      <div class="stat-label">今日 API 调用</div>
-    </div>
-  </div>
-  <div class="section-title">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
-    订阅源
-  </div>
-  ${feeds.length > 0 ? feedCards : '<div class="empty">暂无订阅，通过 Telegram Bot 添加。</div>'}
-  <div class="footer">Powered by Cloudflare Workers &amp; D1</div>
-</div>
-</body>
-</html>`;
-}
-
-function esc(s) {
-  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────
@@ -510,7 +770,7 @@ export default {
   fetch: app.fetch,
 
   async scheduled(event, env, ctx) {
-    console.log(`[scheduled] cron: ${event.cron}`);
+    logInfo('scheduled.triggered', { cron: event.cron });
     if (event.cron === '0 * * * *') {
       ctx.waitUntil(refreshAllCaches(env));
     }

@@ -1,5 +1,93 @@
 // D1 Database operations for Social RSS Bridge
 
+import { stripHtml } from './html.js';
+
+function safeParseJson(value, fallback) {
+  try {
+    return JSON.parse(value || '');
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeWhitespace(value = '') {
+  return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function hashString(input) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function toSecondBucket(date) {
+  const time = new Date(date || '').getTime();
+  if (Number.isNaN(time)) return '';
+  return String(Math.floor(time / 1000));
+}
+
+function extractAssetSignature(url) {
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname.split('/').filter(Boolean).slice(-2).join('/');
+  } catch {
+    return '';
+  }
+}
+
+function inferMediaType(post) {
+  if (post.media_type) return post.media_type;
+  if ((post.description || '').includes('<video')) return 'video';
+  return (post.raw_images || []).length > 0 || post.image ? 'image' : 'unknown';
+}
+
+function buildContentHash(platform, userId, post) {
+  const titleSeed = normalizeWhitespace(post.title || stripHtml(post.description || '').split('\n')[0] || '').toLowerCase();
+  const dateSeed = toSecondBucket(post.date);
+  const assetSeed = extractAssetSignature(post.image || post.raw_images?.[0] || '');
+
+  if (platform === 'xhs') {
+    return `xhs:${hashString(`${userId}|${titleSeed}|${dateSeed}|${assetSeed}`)}`;
+  }
+
+  return `${platform}:${hashString(`${userId}|${post.link || post.id || ''}|${dateSeed}`)}`;
+}
+
+function enrichPostForStorage(platform, userId, post) {
+  const rawImages = Array.isArray(post.raw_images) ? post.raw_images : [];
+  const canonicalId = post.canonical_id || post.id || post.post_id || '';
+  const mediaType = inferMediaType({ ...post, raw_images: rawImages });
+
+  return {
+    ...post,
+    raw_images: rawImages,
+    canonical_id: canonicalId,
+    media_type: mediaType,
+    content_hash: post.content_hash || buildContentHash(platform, userId, {
+      ...post,
+      raw_images: rawImages,
+      media_type: mediaType
+    })
+  };
+}
+
+function rowScore(row) {
+  const rawImages = safeParseJson(row.raw_images, []);
+  let score = 0;
+
+  if ((row.media_type || '').includes('video') || (row.description || '').includes('<video')) score += 1000;
+  score += rawImages.length * 10;
+  score += (row.description || '').length;
+  if (row.image) score += 5;
+  if (row.canonical_id && row.canonical_id === row.post_id) score += 20;
+
+  return score;
+}
+
 // ─── Accounts ────────────────────────────────────────────────────────────────
 
 export async function getAccounts(db) {
@@ -36,11 +124,12 @@ export async function addAccount(db, platform, userId, displayName = '') {
 
 export async function removeAccount(db, platform, userId) {
   try {
+    const cachePlatform = platform === 'instagram' ? 'ig' : 'xhs';
     const result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND user_id = ?')
       .bind(platform, userId).run();
-    // Also clean up cached posts
-    await db.prepare('DELETE FROM posts_cache WHERE platform = ? AND user_id = ?')
-      .bind(platform, userId).run();
+    await clearCachedPosts(db, cachePlatform, userId);
+    await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND user_id = ?')
+      .bind(cachePlatform, userId).run().catch(() => {});
     return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] removeAccount error:', e.message);
@@ -53,34 +142,144 @@ export async function removeAccount(db, platform, userId) {
 export async function getCachedPostIds(db, platform, userId) {
   try {
     const { results } = await db.prepare(
-      'SELECT post_id FROM posts_cache WHERE platform = ? AND user_id = ?'
+      'SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND user_id = ?'
     ).bind(platform, userId).all();
-    return new Set((results || []).map(r => r.post_id));
+
+    const ids = new Set();
+    for (const row of results || []) {
+      if (row.post_id) ids.add(row.post_id);
+      if (row.canonical_id) ids.add(row.canonical_id);
+    }
+    return ids;
   } catch { return new Set(); }
 }
 
 export async function getCachedPosts(db, platform, userId, limit = 50) {
   try {
     const { results } = await db.prepare(
-      'SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY date DESC LIMIT ?'
+      'SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY date DESC, fetched_at DESC, id DESC LIMIT ?'
     ).bind(platform, userId, limit).all();
     return results || [];
   } catch { return []; }
 }
 
-export async function upsertPosts(db, platform, userId, posts) {
-  if (!posts || posts.length === 0) return { total: 0, newCount: 0 };
+export async function clearCachedPosts(db, platform, userId) {
+  try {
+    const result = await db.prepare('DELETE FROM posts_cache WHERE platform = ? AND user_id = ?')
+      .bind(platform, userId).run();
+    return result.meta.changes || 0;
+  } catch (e) {
+    console.error('[db] clearCachedPosts error:', e.message);
+    return 0;
+  }
+}
+
+export async function dedupeCachedPosts(db, platform, userId) {
+  try {
+    const { results } = await db.prepare(
+      'SELECT * FROM posts_cache WHERE platform = ? AND user_id = ? ORDER BY fetched_at DESC, id DESC'
+    ).bind(platform, userId).all();
+
+    const rows = results || [];
+    const keepByKey = new Map();
+    const deleteIds = [];
+    const updateBatch = [];
+
+    for (const row of rows) {
+      const post = rowToPost(row);
+      const enriched = enrichPostForStorage(platform, userId, post);
+      const key = platform === 'xhs'
+        ? enriched.content_hash
+        : (enriched.canonical_id || row.post_id);
+
+      if (!key) continue;
+
+      if (row.canonical_id !== enriched.canonical_id || row.content_hash !== enriched.content_hash || row.media_type !== enriched.media_type) {
+        updateBatch.push(
+          db.prepare(
+            'UPDATE posts_cache SET canonical_id = ?, content_hash = ?, media_type = ? WHERE id = ?'
+          ).bind(enriched.canonical_id, enriched.content_hash, enriched.media_type, row.id)
+        );
+      }
+
+      const current = { row, score: rowScore({ ...row, media_type: enriched.media_type }) };
+      const existing = keepByKey.get(key);
+
+      if (!existing) {
+        keepByKey.set(key, current);
+        continue;
+      }
+
+      if (current.score > existing.score) {
+        deleteIds.push(existing.row.id);
+        keepByKey.set(key, current);
+      } else {
+        deleteIds.push(row.id);
+      }
+    }
+
+    if (updateBatch.length) await db.batch(updateBatch);
+    if (deleteIds.length) {
+      await db.batch(deleteIds.map(id => db.prepare('DELETE FROM posts_cache WHERE id = ?').bind(id)));
+    }
+
+    return deleteIds.length;
+  } catch (e) {
+    console.error('[db] dedupeCachedPosts error:', e.message);
+    return 0;
+  }
+}
+
+export async function cleanupCachedPosts(db, platform, userId, keepLimit = 100) {
+  if (!keepLimit || keepLimit < 1) return 0;
+
+  try {
+    const { results } = await db.prepare(
+      `SELECT id FROM posts_cache
+       WHERE platform = ? AND user_id = ?
+       ORDER BY date DESC, fetched_at DESC, id DESC
+       LIMIT -1 OFFSET ?`
+    ).bind(platform, userId, keepLimit).all();
+
+    const staleRows = results || [];
+    if (!staleRows.length) return 0;
+
+    await db.batch(staleRows.map(row => db.prepare('DELETE FROM posts_cache WHERE id = ?').bind(row.id)));
+    return staleRows.length;
+  } catch (e) {
+    console.error('[db] cleanupCachedPosts error:', e.message);
+    return 0;
+  }
+}
+
+export async function upsertPosts(db, platform, userId, posts, options = {}) {
+  const keepLimit = Number.isFinite(options.keepLimit) ? options.keepLimit : 100;
+  if (!posts || posts.length === 0) {
+    const dedupedCount = await dedupeCachedPosts(db, platform, userId);
+    const trimmedCount = await cleanupCachedPosts(db, platform, userId, keepLimit);
+    return { total: 0, newCount: 0, dedupedCount, trimmedCount };
+  }
+
   try {
     const existingIds = await getCachedPostIds(db, platform, userId);
-    const newCount = posts.filter(p => !existingIds.has(p.id || p.post_id || '')).length;
+    const preparedPosts = posts.map(post => enrichPostForStorage(platform, userId, post));
+    const newCount = preparedPosts.filter(p => !existingIds.has(p.id || p.post_id || '')).length;
 
     const stmt = db.prepare(
-      `INSERT OR REPLACE INTO posts_cache (platform, user_id, post_id, title, description, link, image, date, raw_images, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+      `INSERT OR REPLACE INTO posts_cache (
+         platform, user_id, post_id, canonical_id, content_hash, media_type,
+         title, description, link, image, date, raw_images, fetched_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
     );
-    const batch = posts.map(p => stmt.bind(
-      platform, userId,
+
+    const batch = preparedPosts.map(p => stmt.bind(
+      platform,
+      userId,
       p.id || p.post_id || '',
+      p.canonical_id || '',
+      p.content_hash || '',
+      p.media_type || '',
       p.title || '',
       p.description || '',
       p.link || '',
@@ -88,11 +287,16 @@ export async function upsertPosts(db, platform, userId, posts) {
       p.date || '',
       JSON.stringify(p.raw_images || [])
     ));
+
     await db.batch(batch);
-    return { total: posts.length, newCount };
+
+    const dedupedCount = await dedupeCachedPosts(db, platform, userId);
+    const trimmedCount = await cleanupCachedPosts(db, platform, userId, keepLimit);
+
+    return { total: preparedPosts.length, newCount, dedupedCount, trimmedCount };
   } catch (e) {
     console.error('[db] upsertPosts error:', e.message);
-    return { total: posts.length, newCount: 0 };
+    return { total: posts.length, newCount: 0, dedupedCount: 0, trimmedCount: 0 };
   }
 }
 
@@ -110,6 +314,110 @@ export async function isCacheStale(db, platform, userId, ttlMinutes) {
   if (!lastFetch) return true;
   const age = Date.now() - new Date(lastFetch + 'Z').getTime();
   return age > ttlMinutes * 60 * 1000;
+}
+
+// ─── Crawl Status ─────────────────────────────────────────────────────────────
+
+export async function getCrawlStatus(db, platform, userId) {
+  try {
+    return await db.prepare(
+      'SELECT * FROM crawl_status WHERE platform = ? AND user_id = ?'
+    ).bind(platform, userId).first();
+  } catch { return null; }
+}
+
+export async function getCrawlStatuses(db) {
+  try {
+    const { results } = await db.prepare(
+      'SELECT * FROM crawl_status ORDER BY platform, user_id'
+    ).all();
+    return results || [];
+  } catch { return []; }
+}
+
+export async function markCrawlSuccess(db, platform, userId, status) {
+  try {
+    await db.prepare(
+      `INSERT INTO crawl_status (
+         platform, user_id, last_attempt_at, last_success_at, last_result,
+         last_error, last_error_at, consecutive_failures, last_post_count,
+         last_new_count, last_empty_reason, last_duration_ms,
+         last_alerted_failure_count, updated_at
+       )
+       VALUES (?, ?, datetime('now'), datetime('now'), ?, '', NULL, 0, ?, ?, ?, ?, 0, datetime('now'))
+       ON CONFLICT(platform, user_id) DO UPDATE SET
+         last_attempt_at = datetime('now'),
+         last_success_at = datetime('now'),
+         last_result = excluded.last_result,
+         last_error = '',
+         last_error_at = NULL,
+         consecutive_failures = 0,
+         last_post_count = excluded.last_post_count,
+         last_new_count = excluded.last_new_count,
+         last_empty_reason = excluded.last_empty_reason,
+         last_duration_ms = excluded.last_duration_ms,
+         last_alerted_failure_count = 0,
+         updated_at = datetime('now')`
+    ).bind(
+      platform,
+      userId,
+      status.result || 'updated',
+      status.postCount || 0,
+      status.newCount || 0,
+      status.emptyReason || '',
+      status.durationMs || 0
+    ).run();
+  } catch (e) {
+    console.error('[db] markCrawlSuccess error:', e.message);
+  }
+}
+
+export async function markCrawlFailure(db, platform, userId, status) {
+  try {
+    await db.prepare(
+      `INSERT INTO crawl_status (
+         platform, user_id, last_attempt_at, last_success_at, last_result,
+         last_error, last_error_at, consecutive_failures, last_post_count,
+         last_new_count, last_empty_reason, last_duration_ms,
+         last_alerted_failure_count, updated_at
+       )
+       VALUES (?, ?, datetime('now'), NULL, 'error', ?, datetime('now'), 1, 0, 0, '', ?, 0, datetime('now'))
+       ON CONFLICT(platform, user_id) DO UPDATE SET
+         last_attempt_at = datetime('now'),
+         last_result = 'error',
+         last_error = excluded.last_error,
+         last_error_at = datetime('now'),
+         consecutive_failures = crawl_status.consecutive_failures + 1,
+         last_duration_ms = excluded.last_duration_ms,
+         updated_at = datetime('now')`
+    ).bind(
+      platform,
+      userId,
+      status.error || 'Unknown error',
+      status.durationMs || 0
+    ).run();
+  } catch (e) {
+    console.error('[db] markCrawlFailure error:', e.message);
+  }
+}
+
+export async function setFailureAlertCount(db, platform, userId, count) {
+  try {
+    await db.prepare(
+      `INSERT INTO crawl_status (
+         platform, user_id, last_attempt_at, last_success_at, last_result,
+         last_error, last_error_at, consecutive_failures, last_post_count,
+         last_new_count, last_empty_reason, last_duration_ms,
+         last_alerted_failure_count, updated_at
+       )
+       VALUES (?, ?, NULL, NULL, '', '', NULL, 0, 0, 0, '', 0, ?, datetime('now'))
+       ON CONFLICT(platform, user_id) DO UPDATE SET
+         last_alerted_failure_count = excluded.last_alerted_failure_count,
+         updated_at = datetime('now')`
+    ).bind(platform, userId, count).run();
+  } catch (e) {
+    console.error('[db] setFailureAlertCount error:', e.message);
+  }
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -170,11 +478,14 @@ export async function getApiUsageSummary(db, days = 7) {
 export function rowToPost(row) {
   return {
     id: row.post_id,
+    canonical_id: row.canonical_id || row.post_id,
+    content_hash: row.content_hash || '',
+    media_type: row.media_type || '',
     title: row.title,
     description: row.description,
     link: row.link,
     image: row.image,
     date: row.date,
-    raw_images: JSON.parse(row.raw_images || '[]')
+    raw_images: safeParseJson(row.raw_images, [])
   };
 }
