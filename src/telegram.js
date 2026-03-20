@@ -67,6 +67,15 @@ export async function setWebhook(token, url, secretToken = '') {
   return parseTelegramResponse(resp, 'setWebhook');
 }
 
+export async function setMyCommands(token, commands) {
+  const resp = await fetch(`${TG_API}${token}/setMyCommands`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commands })
+  });
+  return parseTelegramResponse(resp, 'setMyCommands');
+}
+
 export function verifyWebhookSecret(request, expectedSecret) {
   if (!expectedSecret) return true;
   const header = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';

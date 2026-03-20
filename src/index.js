@@ -9,7 +9,8 @@ import {
   getSetting, setSetting, setFailureAlertCount
 } from './db.js';
 import { generateInstagramFeed, generateXhsFeed } from './rss.js';
-import { sendMessage, setWebhook, parseCommand, verifyWebhookSecret, escapeHtml } from './telegram.js';
+import { sendMessage, setWebhook, setMyCommands, parseCommand, verifyWebhookSecret, escapeHtml } from './telegram.js';
+import { buildTelegramHelpMessage, getTelegramBotCommands } from './telegram_commands.js';
 import { handleImageProxy, handleMediaProxy } from './proxy.js';
 import { fetchProfile as fetchIg, validateProfile as validateIg } from './crawlers/instagram.js';
 import { fetchProfile as fetchXhs, validateProfile as validateXhs } from './crawlers/xhs_tikhub.js';
@@ -369,6 +370,13 @@ function formatStatusSummary(statuses) {
   return counts;
 }
 
+async function syncTelegramCommands(env) {
+  const commands = getTelegramBotCommands();
+  const result = await setMyCommands(env.TELEGRAM_BOT_TOKEN, commands);
+  logInfo('telegram.commands_synced', { count: commands.length });
+  return result;
+}
+
 // ─── Closed Public Pages ──────────────────────────────────────────────────────
 
 app.get('/', c => c.text('Not Found', 404));
@@ -455,8 +463,17 @@ app.post('/setup-webhook', async c => {
 
   const baseUrl = getBaseUrl(c.env, c.req.raw);
   const secretToken = c.env.ADMIN_TOKEN || '';
-  const result = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
-  return c.json(result);
+  const webhook = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
+  const commands = await syncTelegramCommands(c.env);
+  return c.json({ webhook, commands });
+});
+
+app.post('/admin/sync-telegram-commands', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
+  const result = await syncTelegramCommands(c.env);
+  return c.json({ commands: result });
 });
 
 // ─── Admin: 手动刷新缓存 ─────────────────────────────────────────────────────
@@ -512,24 +529,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
     switch (cmd) {
       case 'start':
       case 'help':
-        await sendMessage(token, chatId,
-          '🤖 <b>Social RSS Bridge</b>\n\n' +
-          '<b>订阅管理：</b>\n' +
-          '/add_ig &lt;username&gt; [displayName] — 添加 IG 订阅\n' +
-          '/add_xhs &lt;userId&gt; [displayName] — 添加小红书订阅\n' +
-          '/remove_ig &lt;username&gt; — 删除 IG 订阅\n' +
-          '/remove_xhs &lt;userId&gt; — 删除小红书订阅\n' +
-          '/list — 列出所有订阅\n\n' +
-          '<b>运维：</b>\n' +
-          '/feeds — 列出 RSS 链接\n' +
-          '/status — 查看服务状态\n' +
-          '/api_usage [天数] — TikHub API 调用量\n' +
-          '/refresh — 刷新全部缓存\n' +
-          '/refresh_ig &lt;username&gt; — 刷新单个 IG\n' +
-          '/refresh_xhs &lt;userId&gt; — 刷新单个小红书\n' +
-          '/purge_ig &lt;username&gt; — 清理单个 IG 缓存\n' +
-          '/purge_xhs &lt;userId&gt; — 清理单个小红书缓存\n' +
-          '/help — 显示此帮助');
+        await sendMessage(token, chatId, buildTelegramHelpMessage());
         break;
 
       case 'add_ig': {
@@ -749,6 +749,13 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
         await sendMessage(token, chatId,
           `🧹 已清理小红书缓存：<code>${escapeHtml(userId)}</code>\n` +
           `删除条数：<b>${result.removed}</b>`);
+        break;
+      }
+
+      case 'sync_commands': {
+        await sendMessage(token, chatId, '🔄 正在同步 Telegram 机器人命令菜单...');
+        await syncTelegramCommands(env);
+        await sendMessage(token, chatId, '✅ Telegram 机器人命令菜单已同步。');
         break;
       }
 
