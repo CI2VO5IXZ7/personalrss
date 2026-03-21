@@ -79,7 +79,16 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
     };
   }
 
+  // 记录列表接口返回的所有 note ID，便于排查增量命中率
+  logInfo('xhs.notes_list', {
+    userId,
+    sourceCount: notes.length,
+    cachedCount: existingIds.size,
+    noteIds: notes.map(n => ({ id: n.id || '', note_id: n.note_id || '', type: n.type || 'normal' }))
+  });
+
   const results = [];
+  let cacheHits = 0;
 
   for (const note of notes) {
     const noteId = note.id || note.note_id || '';
@@ -87,8 +96,18 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
 
     // 增量逻辑：已缓存的笔记跳过详情 API 调用
     if (existingIds.has(noteId)) {
+      cacheHits += 1;
       continue;
     }
+
+    // 记录每一条缓存未命中的笔记，以及 existingIds 中的样本（方便对比 ID 格式）
+    logInfo('xhs.note_cache_miss', {
+      userId,
+      noteId,
+      noteIdFields: { id: note.id || null, note_id: note.note_id || null },
+      noteType,
+      cachedSample: [...existingIds].slice(0, 5)
+    });
 
     // 只对新笔记调用对应的详情接口
     const endpoint = noteType === 'video' ? 'get_video_note_detail' : 'get_image_note_detail';
@@ -105,6 +124,8 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
           }
         }
       }
+      // detail 接口返回了数据但解析为空
+      logWarn('xhs.detail_parse_empty', { userId, noteId, noteType, endpoint });
     } catch (e) {
       logWarn('xhs.detail_fetch_failed', {
         userId,
@@ -124,6 +145,8 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
     userId,
     sourceCount: notes.length,
     cachedCount: existingIds.size,
+    cacheHits,
+    cacheMisses: notes.length - cacheHits,
     newFetchedCount: results.length,
     state: results.length === 0 ? 'no_new_posts' : 'updated'
   });
