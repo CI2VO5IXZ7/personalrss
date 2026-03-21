@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import {
   getAccounts, getAccountsByPlatform, getAccount,
   addAccount, removeAccount,
-  getCachedPosts, getCachedPostIds, upsertPosts, isCacheStale, rowToPost,
+  getCachedPosts, getCachedPostIds, upsertPosts, rowToPost,
   getApiUsage, getApiUsageSummary,
   clearCachedPosts, getCrawlStatuses, getCrawlStatus,
   clearCachedPostsByPlatform,
@@ -24,10 +24,6 @@ const app = new Hono();
 function getBaseUrl(env, req) {
   const raw = env.BASE_URL || `https://${new URL(req.url).host}`;
   return String(raw).replace(/\/+$/, '');
-}
-
-function cacheTtl(env) {
-  return parseInt(env.CACHE_TTL_MINUTES || '60', 10);
 }
 
 function cachePostLimit(env) {
@@ -395,7 +391,7 @@ app.get('/status', c => c.text('Not Found', 404));
 app.get('/img', handleImageProxy);
 app.get('/media', handleMediaProxy);
 
-// ─── Instagram RSS（D1 缓存优先）──────────────────────────────────────────────
+// ─── Instagram RSS（仅返回缓存，不触发刷新）─────────────────────────────────────
 
 app.get('/rss/ig/:username', async c => {
   const { username } = c.req.param();
@@ -408,7 +404,6 @@ app.get('/rss/ig/:username', async c => {
 
   const canonicalUsername = account.user_id;
   const displayName = account.display_name || canonicalUsername;
-  const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
 
   if (username !== canonicalUsername) {
@@ -417,24 +412,11 @@ app.get('/rss/ig/:username', async c => {
 
   const cachedRows = await getCachedPosts(db, 'ig', canonicalUsername);
   const cachedPosts = cachedRows.map(rowToPost);
-  const stale = await isCacheStale(db, 'ig', canonicalUsername, ttl);
-
-  if (stale || cachedPosts.length === 0) {
-    c.executionCtx.waitUntil(
-      refreshInstagramAccount(c.env, account).catch(e => {
-        logError('rss.background_refresh_failed', {
-          platform: 'ig',
-          userId: canonicalUsername,
-          error: e
-        });
-      })
-    );
-  }
 
   return rssResponse(generateInstagramFeed(canonicalUsername, displayName, cachedPosts, baseUrl));
 });
 
-// ─── 小红书 RSS（D1 缓存优先，TikHub API）─────────────────────────────────────
+// ─── 小红书 RSS（仅返回缓存，不触发刷新）─────────────────────────────────────
 
 app.get('/rss/xhs/:userId', async c => {
   const { userId } = c.req.param();
@@ -446,24 +428,10 @@ app.get('/rss/xhs/:userId', async c => {
   }
 
   const displayName = account.display_name || userId;
-  const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
 
   const cachedRows = await getCachedPosts(db, 'xhs', userId);
   const cachedPosts = cachedRows.map(rowToPost);
-  const stale = await isCacheStale(db, 'xhs', userId, ttl);
-
-  if (stale || cachedPosts.length === 0) {
-    c.executionCtx.waitUntil(
-      refreshXhsAccount(c.env, account).catch(e => {
-        logError('rss.background_refresh_failed', {
-          platform: 'xhs',
-          userId,
-          error: e
-        });
-      })
-    );
-  }
 
   return rssResponse(generateXhsFeed(userId, displayName, cachedPosts, baseUrl));
 });
