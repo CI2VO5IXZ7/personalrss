@@ -52,11 +52,56 @@ has_real_value() {
   esac
 }
 
+upsert_wrangler_var() {
+  local key="$1"
+  local value="$2"
+
+  [ -n "$value" ] || return 0
+
+  if grep -qE "^${key} = " wrangler.toml; then
+    sed -i "s|^${key} = .*|${key} = \"${value}\"|" wrangler.toml
+  else
+    if grep -q '^\[vars\]' wrangler.toml; then
+      awk -v key="$key" -v value="$value" '
+        BEGIN { inserted = 0 }
+        /^\[vars\]/ {
+          print
+          print key " = \"" value "\""
+          inserted = 1
+          next
+        }
+        { print }
+        END {
+          if (!inserted) {
+            print ""
+            print "[vars]"
+            print key " = \"" value "\""
+          }
+        }
+      ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
+    else
+      {
+        echo ""
+        echo "[vars]"
+        echo "${key} = \"${value}\""
+      } >> wrangler.toml
+    fi
+  fi
+}
+
 # ─── 2. 安装依赖 ───────────────────────────────────────────────────────────────
 
 echo ""
 echo "[1/6] 安装 npm 依赖..."
 npm install --silent 2>&1 | tail -1
+
+echo "[1.5/6] 同步 Worker 配置变量..."
+upsert_wrangler_var "CACHE_TTL_MINUTES" "${CACHE_TTL_MINUTES:-60}"
+upsert_wrangler_var "CACHE_MAX_POSTS" "${CACHE_MAX_POSTS:-100}"
+upsert_wrangler_var "REFRESH_CONCURRENCY" "${REFRESH_CONCURRENCY:-3}"
+upsert_wrangler_var "FAILURE_ALERT_THRESHOLD" "${FAILURE_ALERT_THRESHOLD:-3}"
+upsert_wrangler_var "API_USAGE_ALERT_THRESHOLD" "${API_USAGE_ALERT_THRESHOLD:-500}"
+echo "  ✅ 已同步 wrangler.toml [vars]"
 
 # ─── 3. 创建 D1 数据库 ────────────────────────────────────────────────────────
 

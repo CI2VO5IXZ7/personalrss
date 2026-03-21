@@ -18,6 +18,10 @@ migrations_dir = "migrations"
 crons = ["0 * * * *"]
 
 [vars]
+API_USAGE_ALERT_THRESHOLD = "200"
+FAILURE_ALERT_THRESHOLD = "10"
+REFRESH_CONCURRENCY = "30"
+CACHE_MAX_POSTS = "100"
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
 
