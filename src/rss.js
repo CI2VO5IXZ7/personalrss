@@ -1,7 +1,7 @@
 // RSS 2.0 XML 生成 — 含媒体代理 URL 替换
 
 import { escapeHtml, stripHtml } from './html.js';
-import { proxyImageUrl, proxyHtmlAssets } from './proxy.js';
+import { proxyHtmlAssets, proxyImageUrl, proxyMediaUrl } from './proxy.js';
 
 // 将日期格式化为 RFC 822 北京时间（+0800）
 function toBeijingRFC822(date) {
@@ -32,8 +32,7 @@ function buildItemsXml(items, baseUrl) {
 
     const summary = buildSummary(item.description || content);
 
-    // enclosure 图片也走代理
-    const proxyImg = item.image ? proxyImageUrl(item.image, baseUrl) : '';
+    const enclosure = buildEnclosure(item, baseUrl);
 
     return `    <item>
       <title><![CDATA[${item.title || ''}]]></title>
@@ -42,9 +41,35 @@ function buildItemsXml(items, baseUrl) {
       <pubDate>${toBeijingRFC822(validDate)}</pubDate>
       <description>${escapeXml(summary)}</description>
       <content:encoded><![CDATA[${content}]]></content:encoded>
-      ${proxyImg ? `<enclosure url="${escapeXml(proxyImg)}" type="image/jpeg" length="0"/>` : ''}
+      ${enclosure ? `<enclosure url="${escapeXml(enclosure.url)}" type="${escapeXml(enclosure.type)}" length="0"/>` : ''}
     </item>`;
   }).join('\n');
+}
+
+function buildEnclosure(item, baseUrl) {
+  const rawDescription = item.description || '';
+  const videoUrl = extractFirstVideoUrl(rawDescription);
+
+  if ((item.media_type || '').includes('video') && videoUrl) {
+    return {
+      url: proxyMediaUrl(videoUrl, baseUrl),
+      type: 'video/mp4'
+    };
+  }
+
+  if (item.image) {
+    return {
+      url: proxyImageUrl(item.image, baseUrl),
+      type: 'image/jpeg'
+    };
+  }
+
+  return null;
+}
+
+function extractFirstVideoUrl(html) {
+  const match = String(html).match(/<source[^>]+src="([^"]+)"/i);
+  return match?.[1] || '';
 }
 
 function buildSummary(content) {
