@@ -1,17 +1,13 @@
-# Optional: use these only if you want API Token auth for deploy scripts.
-# Leave them empty to use browser auth via `npx wrangler login`.
-CF_ACCOUNT_ID=
-CF_API_TOKEN=
+# Wrangler local dev variables
+# Copy to .dev.vars before running `npm run dev`
 
-# Worker vars
-BASE_URL=https://your-worker.workers.dev
+BASE_URL=http://127.0.0.1:8787
 CACHE_TTL_MINUTES=60
 CACHE_MAX_POSTS=100
 REFRESH_CONCURRENCY=3
 FAILURE_ALERT_THRESHOLD=3
 API_USAGE_ALERT_THRESHOLD=500
 
-# Worker secrets
 TIKHUB_API_TOKEN=your_tikhub_api_bearer_token
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id

@@ -20,7 +20,7 @@ const COMMAND_SECTIONS = [
       { command: 'refresh', usage: '/refresh', description: '刷新全部缓存' },
       { command: 'refresh_ig', usage: '/refresh_ig <username>', description: '刷新单个 IG' },
       { command: 'refresh_xhs', usage: '/refresh_xhs <userId>', description: '刷新单个小红书' },
-      { command: 'purge_ig', usage: '/purge_ig <username>', description: '清理单个 IG 缓存' },
+      { command: 'purge_ig', usage: '/purge_ig', description: '清理全部 IG 缓存' },
       { command: 'purge_xhs', usage: '/purge_xhs <userId>', description: '清理单个小红书缓存' },
       { command: 'sync_commands', usage: '/sync_commands', description: '同步机器人命令菜单' },
       { command: 'help', usage: '/help', description: '显示帮助' }

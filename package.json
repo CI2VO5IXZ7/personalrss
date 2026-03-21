@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --local",
+    "dev:remote": "wrangler dev --remote",
+    "check": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"
   },
@@ -12,6 +14,6 @@
     "hono": "^4.4.0"
   },
   "devDependencies": {
-    "wrangler": "^3.60.0"
+    "wrangler": "^4.76.0"
   }
 }

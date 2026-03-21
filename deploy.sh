@@ -2,7 +2,7 @@
 # Social RSS Bridge 一键部署脚本
 # 用法: 配好 .env 后运行 ./deploy.sh
 
-set -e
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -25,7 +25,7 @@ source <(grep -v '^\s*#' .env | grep -v '^\s*$')
 set +a
 
 # 校验必要变量
-REQUIRED_VARS="CF_ACCOUNT_ID CF_API_TOKEN TIKHUB_API_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_TOKEN"
+REQUIRED_VARS="TIKHUB_API_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_TOKEN"
 MISSING=""
 for var in $REQUIRED_VARS; do
   if [ -z "${!var}" ]; then
@@ -40,6 +40,18 @@ fi
 
 echo "✅ .env 配置已加载"
 
+has_real_value() {
+  local value="$1"
+  case "$value" in
+    ""|"your_cloudflare_account_id"|"your_cloudflare_api_token")
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 # ─── 2. 安装依赖 ───────────────────────────────────────────────────────────────
 
 echo ""
@@ -50,10 +62,31 @@ npm install --silent 2>&1 | tail -1
 
 echo "[2/6] 检查 D1 数据库..."
 
-export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID"
-export CLOUDFLARE_API_TOKEN="$CF_API_TOKEN"
-
 D1_DB_NAME="social-rss-bridge-db"
+
+if has_real_value "${CF_ACCOUNT_ID:-}" && has_real_value "${CF_API_TOKEN:-}"; then
+  ACCOUNT_ID_VALUE="$CF_ACCOUNT_ID"
+  API_TOKEN_VALUE="$CF_API_TOKEN"
+  unset CF_ACCOUNT_ID
+  unset CF_API_TOKEN
+  export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID_VALUE"
+  export CLOUDFLARE_API_TOKEN="$API_TOKEN_VALUE"
+  echo "  使用 API Token 认证"
+else
+  unset CF_ACCOUNT_ID
+  unset CF_API_TOKEN
+  unset CLOUDFLARE_ACCOUNT_ID
+  unset CLOUDFLARE_API_TOKEN
+  echo "  使用浏览器授权认证（wrangler login）"
+
+  if ! npx wrangler whoami >/dev/null 2>&1; then
+    echo "  未检测到 Wrangler 登录态，正在打开浏览器授权..."
+    npx wrangler login || {
+      echo "  ❌ Wrangler 登录失败，请手动执行: npx wrangler login"
+      exit 1
+    }
+  fi
+fi
 
 # 检查 wrangler.toml 中是否还是占位符
 if grep -q "REPLACE_WITH_D1_DATABASE_ID" wrangler.toml; then
@@ -135,12 +168,13 @@ fi
 
 echo "[6/6] 设置 Telegram Webhook..."
 if [ -n "$WORKER_URL" ]; then
-  WEBHOOK_RESP=$(curl -sf "$WORKER_URL/setup-webhook?token=$ADMIN_TOKEN" 2>&1) || true
+  WEBHOOK_RESP=$(curl -sf -X POST "$WORKER_URL/setup-webhook" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" 2>&1) || true
   if echo "$WEBHOOK_RESP" | grep -q '"ok":true'; then
     echo "  ✅ Telegram Webhook 设置成功"
   else
     echo "  ⚠️  Webhook 设置可能需要等待 Worker 生效后重试："
-    echo "     curl \"$WORKER_URL/setup-webhook?token=$ADMIN_TOKEN\""
+    echo "     curl -X POST \"$WORKER_URL/setup-webhook\" -H \"Authorization: Bearer <ADMIN_TOKEN>\""
   fi
 else
   echo "  ⚠️  无法获取 Worker URL，请手动设置 Webhook"

@@ -48,12 +48,15 @@ Cloudflare Worker
 
 ### 1. 部署脚本使用
 
-这些变量主要给 `deploy.sh` 使用：
+`deploy.sh` 支持两种 Cloudflare 认证方式：
+
+- 浏览器授权登录：推荐。先执行 `npx wrangler login`，然后 `.env` 里不用填 `CF_ACCOUNT_ID` / `CF_API_TOKEN`
+- API Token：适合 CI 或纯命令行环境
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `CF_ACCOUNT_ID` | 是 | Cloudflare Account ID |
-| `CF_API_TOKEN` | 是 | 具备 Workers / D1 编辑权限的 Cloudflare API Token |
+| `CF_ACCOUNT_ID` | 否 | 使用 API Token 认证时需要的 Cloudflare Account ID |
+| `CF_API_TOKEN` | 否 | 使用 API Token 认证时需要，需具备 Workers / D1 编辑权限 |
 
 ### 2. Worker 运行时变量
 
@@ -87,7 +90,17 @@ Cloudflare Worker
 npm install
 ```
 
-### 2. 创建 D1 数据库并执行迁移
+### 2. Cloudflare 浏览器授权登录
+
+如果你不想手填 `CF_ACCOUNT_ID` 和 `CF_API_TOKEN`，先执行：
+
+```bash
+npx wrangler login
+```
+
+登录完成后，`.env` 里的这两个字段可以留空，`./deploy.sh` 会直接复用 Wrangler 的网页授权登录态。
+
+### 3. 创建 D1 数据库并执行迁移
 
 如果你不是通过 `deploy.sh` 一键部署，需要确保 D1 已创建并执行全部迁移：
 
@@ -95,13 +108,13 @@ npm install
 npx wrangler d1 migrations apply social-rss-bridge-db
 ```
 
-### 3. 部署 Worker
+### 4. 部署 Worker
 
 ```bash
 npx wrangler deploy
 ```
 
-### 4. 设置 Telegram Webhook 并同步机器人命令菜单
+### 5. 设置 Telegram Webhook 并同步机器人命令菜单
 
 部署完成后，调用：
 
@@ -166,7 +179,7 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | `/refresh` | 手动刷新全部缓存 |
 | `/refresh_ig <username>` | 刷新单个 Instagram 订阅 |
 | `/refresh_xhs <userId>` | 刷新单个小红书订阅 |
-| `/purge_ig <username>` | 清理单个 Instagram 缓存 |
+| `/purge_ig` | 清理全部 Instagram 缓存 |
 | `/purge_xhs <userId>` | 清理单个小红书缓存 |
 | `/sync_commands` | 同步 Telegram 机器人命令菜单 |
 | `/help` | 显示帮助 |
@@ -221,16 +234,44 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 npm install
 ```
 
+### 本地启动
+
+Wrangler 本地调试默认读取 `.dev.vars`，不是 `.env`。先复制模板：
+
+```bash
+cp .dev.vars.example .dev.vars
+```
+
+然后执行本地 D1 迁移并启动：
+
+```bash
+npx wrangler d1 migrations apply social-rss-bridge-db --local
+npm run dev
+```
+
+默认地址：
+
+```txt
+http://127.0.0.1:8787
+```
+
+如果你想直接连 Cloudflare 远端资源调试，可用：
+
+```bash
+npm run dev:remote
+```
+
 ### 本地构建检查
 
 ```bash
-npx wrangler deploy --dry-run
+npm run check
 ```
 
 ### 推荐检查项
 
 - `npm install`
-- `npx wrangler deploy --dry-run`
+- `npx wrangler d1 migrations apply social-rss-bridge-db --local`
+- `npm run check`
 - Telegram 命令菜单同步后，手动在机器人里执行 `/help` 和 `/sync_commands`
 
 ## 常见运维操作

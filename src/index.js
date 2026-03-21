@@ -5,6 +5,7 @@ import {
   getCachedPosts, getCachedPostIds, upsertPosts, isCacheStale, rowToPost,
   getApiUsage, getApiUsageSummary,
   clearCachedPosts, getCrawlStatuses, getCrawlStatus,
+  clearCachedPostsByPlatform,
   markCrawlSuccess, markCrawlFailure,
   getSetting, setSetting, setFailureAlertCount
 } from './db.js';
@@ -21,7 +22,8 @@ const app = new Hono();
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getBaseUrl(env, req) {
-  return env.BASE_URL || `https://${new URL(req.url).host}`;
+  const raw = env.BASE_URL || `https://${new URL(req.url).host}`;
+  return String(raw).replace(/\/+$/, '');
 }
 
 function cacheTtl(env) {
@@ -354,6 +356,12 @@ async function purgeSingleAccount(env, cachePlatform, userId) {
   return { platform: cachePlatform, id: userId, removed };
 }
 
+async function purgePlatformCache(env, cachePlatform) {
+  const removed = await clearCachedPostsByPlatform(env.DB, cachePlatform);
+  logInfo('cache.platform_purged', { platform: cachePlatform, removed });
+  return { platform: cachePlatform, removed };
+}
+
 function formatStatusSummary(statuses) {
   const counts = {
     updated: 0,
@@ -398,27 +406,32 @@ app.get('/rss/ig/:username', async c => {
     return c.text('Forbidden: Account not in whitelist', 403);
   }
 
-  const displayName = account.display_name || username;
+  const canonicalUsername = account.user_id;
+  const displayName = account.display_name || canonicalUsername;
   const ttl = cacheTtl(c.env);
   const baseUrl = getBaseUrl(c.env, c.req.raw);
 
-  const cachedRows = await getCachedPosts(db, 'ig', username);
+  if (username !== canonicalUsername) {
+    return c.redirect(`${baseUrl}/rss/ig/${encodeURIComponent(canonicalUsername)}`, 302);
+  }
+
+  const cachedRows = await getCachedPosts(db, 'ig', canonicalUsername);
   const cachedPosts = cachedRows.map(rowToPost);
-  const stale = await isCacheStale(db, 'ig', username, ttl);
+  const stale = await isCacheStale(db, 'ig', canonicalUsername, ttl);
 
   if (stale || cachedPosts.length === 0) {
     c.executionCtx.waitUntil(
       refreshInstagramAccount(c.env, account).catch(e => {
         logError('rss.background_refresh_failed', {
           platform: 'ig',
-          userId: username,
+          userId: canonicalUsername,
           error: e
         });
       })
     );
   }
 
-  return rssResponse(generateInstagramFeed(username, displayName, cachedPosts, baseUrl));
+  return rssResponse(generateInstagramFeed(canonicalUsername, displayName, cachedPosts, baseUrl));
 });
 
 // ─── 小红书 RSS（D1 缓存优先，TikHub API）─────────────────────────────────────
@@ -534,15 +547,20 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
       case 'add_ig': {
         if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/add_ig &lt;username&gt; [displayName]'); break; }
-        const username = args[0].trim().toLowerCase();
+        const username = args[0].trim();
         const displayName = args.slice(1).join(' ').trim() || username;
+
+        if (await getAccount(db, 'instagram', username)) {
+          await sendMessage(token, chatId, `⚠️ 订阅已存在：<code>${escapeHtml(username)}</code>`);
+          break;
+        }
 
         await sendMessage(token, chatId, `🔎 正在校验 Instagram 账号 <code>${escapeHtml(username)}</code>...`);
         const validation = await validateSubscription(env, 'instagram', username);
         const ok = await addAccount(db, 'instagram', username, displayName);
 
         if (ok) {
-          const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+          const baseUrl = getBaseUrl(env, { url: 'https://your-worker.workers.dev' });
           await sendMessage(token, chatId,
             `✅ 已添加 Instagram 订阅：<b>${escapeHtml(displayName)}</b>\n\n` +
             `📡 RSS: <code>${baseUrl}/rss/ig/${escapeHtml(username)}</code>\n` +
@@ -558,12 +576,17 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
         const userId = args[0].trim();
         const displayName = args.slice(1).join(' ').trim() || userId;
 
+        if (await getAccount(db, 'xiaohongshu', userId)) {
+          await sendMessage(token, chatId, `⚠️ 订阅已存在：<code>${escapeHtml(userId)}</code>`);
+          break;
+        }
+
         await sendMessage(token, chatId, `🔎 正在校验小红书账号 <code>${escapeHtml(userId)}</code>...`);
         const validation = await validateSubscription(env, 'xiaohongshu', userId);
         const ok = await addAccount(db, 'xiaohongshu', userId, displayName);
 
         if (ok) {
-          const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+          const baseUrl = getBaseUrl(env, { url: 'https://your-worker.workers.dev' });
           await sendMessage(token, chatId,
             `✅ 已添加小红书订阅：<b>${escapeHtml(displayName)}</b>\n\n` +
             `📡 RSS: <code>${baseUrl}/rss/xhs/${escapeHtml(userId)}</code>\n` +
@@ -576,7 +599,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
       case 'remove_ig': {
         if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/remove_ig &lt;username&gt;'); break; }
-        const username = args[0].trim().toLowerCase();
+        const username = args[0].trim();
         const ok = await removeAccount(db, 'instagram', username);
         await sendMessage(token, chatId, ok
           ? `✅ 已删除 Instagram 订阅：<code>${escapeHtml(username)}</code>`
@@ -611,7 +634,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
       case 'feeds': {
         const accounts = await getAccounts(db);
-        const baseUrl = env.BASE_URL || 'https://your-worker.workers.dev';
+        const baseUrl = getBaseUrl(env, { url: 'https://your-worker.workers.dev' });
         if (accounts.length === 0) {
           await sendMessage(token, chatId, '📭 暂无订阅，使用 /add_ig 或 /add_xhs 添加。');
           break;
@@ -700,13 +723,15 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
       case 'refresh_ig': {
         if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/refresh_ig &lt;username&gt;'); break; }
-        const username = args[0].trim().toLowerCase();
-        await sendMessage(token, chatId, `🔄 正在刷新 IG <code>${escapeHtml(username)}</code>...`);
-        const result = await refreshSingleAccount(env, 'instagram', username);
-        if (!result) {
-          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(username)}</code>`);
+        const requestedUsername = args[0].trim();
+        const account = await getAccount(db, 'instagram', requestedUsername);
+        if (!account) {
+          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(requestedUsername)}</code>`);
           break;
         }
+        const canonicalUsername = account.user_id;
+        await sendMessage(token, chatId, `🔄 正在刷新 IG <code>${escapeHtml(canonicalUsername)}</code>...`);
+        const result = await refreshInstagramAccount(env, account);
         await sendMessage(token, chatId, describeRefreshState(result));
         break;
       }
@@ -725,15 +750,13 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
       }
 
       case 'purge_ig': {
-        if (!args[0]) { await sendMessage(token, chatId, '❌ 用法：/purge_ig &lt;username&gt;'); break; }
-        const username = args[0].trim().toLowerCase();
-        const result = await purgeSingleAccount(env, 'ig', username);
-        if (!result) {
-          await sendMessage(token, chatId, `⚠️ 未找到订阅：<code>${escapeHtml(username)}</code>`);
+        if (args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/purge_ig');
           break;
         }
+        const result = await purgePlatformCache(env, 'ig');
         await sendMessage(token, chatId,
-          `🧹 已清理 IG 缓存：<code>${escapeHtml(username)}</code>\n` +
+          '🧹 已清理全部 IG 缓存\n' +
           `删除条数：<b>${result.removed}</b>`);
         break;
       }

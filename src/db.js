@@ -122,7 +122,7 @@ export async function getAccountsByPlatform(db, platform) {
       const key = normalizeUserId(platform, row.user_id);
       if (seen.has(key)) continue;
       seen.add(key);
-      deduped.push({ ...row, user_id: key });
+      deduped.push(row);
     }
     return deduped;
   } catch { return []; }
@@ -139,7 +139,7 @@ export async function getAccount(db, platform, userId) {
          LIMIT 1`
       ).bind(platform, normalizedUserId, normalizedUserId).first();
 
-      return row ? { ...row, user_id: normalizedUserId } : null;
+      return row || null;
     }
 
     return await db.prepare('SELECT * FROM accounts WHERE platform = ? AND user_id = ?')
@@ -150,13 +150,14 @@ export async function getAccount(db, platform, userId) {
 export async function addAccount(db, platform, userId, displayName = '') {
   try {
     const normalizedUserId = normalizeUserId(platform, userId);
+    const storedUserId = String(userId).trim();
     if (isCaseInsensitivePlatform(platform)) {
       const existing = await getAccount(db, platform, normalizedUserId);
       if (existing) return false;
     }
 
     const result = await db.prepare('INSERT OR IGNORE INTO accounts (platform, user_id, display_name) VALUES (?, ?, ?)')
-      .bind(platform, normalizedUserId, displayName).run();
+      .bind(platform, isCaseInsensitivePlatform(platform) ? storedUserId : normalizedUserId, displayName).run();
     return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] addAccount error:', e.message);
@@ -236,6 +237,17 @@ export async function clearCachedPosts(db, platform, userId) {
     return result.meta.changes || 0;
   } catch (e) {
     console.error('[db] clearCachedPosts error:', e.message);
+    return 0;
+  }
+}
+
+export async function clearCachedPostsByPlatform(db, platform) {
+  try {
+    const result = await db.prepare('DELETE FROM posts_cache WHERE platform = ?')
+      .bind(platform).run();
+    return result.meta.changes || 0;
+  } catch (e) {
+    console.error('[db] clearCachedPostsByPlatform error:', e.message);
     return 0;
   }
 }
