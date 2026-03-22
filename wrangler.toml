@@ -25,6 +25,21 @@ CACHE_MAX_POSTS = "100"
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
 
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
+
 # Secrets (通过 wrangler secret put 设置，不进代码仓库):
 # TIKHUB_API_TOKEN    - TikHub API Bearer Token (小红书数据抓取)
 # TELEGRAM_BOT_TOKEN  - Telegram Bot Token
