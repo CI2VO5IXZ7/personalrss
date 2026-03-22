@@ -6,7 +6,7 @@
 //   get_image_note_detail  → data.data[0].note_list[0]  含 { note_id, title, desc, time, image_list[].url }
 //   get_video_note_detail  → data.data[0]  直接是笔记对象 { note_id, title, desc, time, images_list[].url, video_info_v2 }
 
-import { trackApiCall } from '../db.js';
+import { trackApiCall, buildContentHash } from '../db.js';
 import { escapeHtml } from '../html.js';
 import { logInfo, logWarn } from '../log.js';
 
@@ -94,13 +94,23 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
     const noteId = note.id || note.note_id || '';
     const noteType = note.type || 'normal';
 
-    // 增量逻辑：已缓存的笔记跳过详情 API 调用
+    // 一级命中：精确 ID 匹配
     if (existingIds.has(noteId)) {
       cacheHits += 1;
       continue;
     }
 
-    // 记录每一条缓存未命中的笔记，以及 existingIds 中的样本（方便对比 ID 格式）
+    // 二级命中：content_hash 匹配（应对 TikHub 返回 ID 漂移的情况）
+    const previewPost = parseNoteFromList(note);
+    if (previewPost) {
+      const previewHash = buildContentHash('xhs', userId, previewPost);
+      if (existingIds.has(previewHash)) {
+        cacheHits += 1;
+        continue;
+      }
+    }
+
+    // 确认为新笔记，记录 cache miss 并调用详情 API
     logInfo('xhs.note_cache_miss', {
       userId,
       noteId,
@@ -136,9 +146,8 @@ export async function fetchProfile(env, userId, existingIds = new Set()) {
       });
     }
 
-    // 详情接口失败时回退到列表数据
-    const parsed = parseNoteFromList(note);
-    if (parsed) results.push(parsed);
+    // 详情接口失败时复用已计算的 previewPost（避免重复调用 parseNoteFromList）
+    if (previewPost) results.push(previewPost);
   }
 
   logInfo('xhs.fetch_profile', {

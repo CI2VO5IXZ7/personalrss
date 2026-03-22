@@ -54,7 +54,7 @@ function inferMediaType(post) {
   return (post.raw_images || []).length > 0 || post.image ? 'image' : 'unknown';
 }
 
-function buildContentHash(platform, userId, post) {
+export function buildContentHash(platform, userId, post) {
   const titleSeed = normalizeWhitespace(post.title || stripHtml(post.description || '').split('\n')[0] || '').toLowerCase();
   const dateSeed = toSecondBucket(post.date);
   const assetSeed = extractAssetSignature(post.image || post.raw_images?.[0] || '');
@@ -200,8 +200,8 @@ export async function getCachedPostIds(db, platform, userId) {
   try {
     const normalizedUserId = normalizeUserId(platform, userId);
     const stmt = isCaseInsensitivePlatform(platform)
-      ? db.prepare('SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ?')
-      : db.prepare('SELECT post_id, canonical_id FROM posts_cache WHERE platform = ? AND user_id = ?');
+      ? db.prepare('SELECT post_id, canonical_id, content_hash FROM posts_cache WHERE platform = ? AND LOWER(user_id) = ?')
+      : db.prepare('SELECT post_id, canonical_id, content_hash FROM posts_cache WHERE platform = ? AND user_id = ?');
 
     const { results } = await stmt.bind(platform, normalizedUserId).all();
 
@@ -209,6 +209,7 @@ export async function getCachedPostIds(db, platform, userId) {
     for (const row of results || []) {
       if (row.post_id) ids.add(row.post_id);
       if (row.canonical_id) ids.add(row.canonical_id);
+      if (row.content_hash) ids.add(row.content_hash);
     }
     return ids;
   } catch { return new Set(); }
