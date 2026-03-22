@@ -21,11 +21,6 @@ crons = ["0 * * * *"]
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
 
-[observability]
-[observability.logs]
-enabled = false
-invocation_logs = true
-
 # Secrets (通过 wrangler secret put 设置，不进代码仓库):
 # TIKHUB_API_TOKEN    - TikHub API Bearer Token (小红书数据抓取)
 # TELEGRAM_BOT_TOKEN  - Telegram Bot Token
