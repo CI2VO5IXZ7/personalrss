@@ -312,10 +312,10 @@ async function refreshAccount(env, account) {
     : refreshXhsAccount(env, account);
 }
 
-async function refreshAllCaches(env) {
+async function refreshAllCaches(env, platform = null) {
   const db = env.DB;
-  const igAccounts = await getAccountsByPlatform(db, 'instagram');
-  const xhsAccounts = await getAccountsByPlatform(db, 'xiaohongshu');
+  const igAccounts = (!platform || platform === 'instagram') ? await getAccountsByPlatform(db, 'instagram') : [];
+  const xhsAccounts = (!platform || platform === 'xiaohongshu') ? await getAccountsByPlatform(db, 'xiaohongshu') : [];
   const tasks = [...igAccounts, ...xhsAccounts];
 
   logInfo('refresh.batch.start', {
@@ -769,8 +769,10 @@ export default {
 
   async scheduled(event, env, ctx) {
     logInfo('scheduled.triggered', { cron: event.cron });
-    if (event.cron === '0 * * * *') {
-      ctx.waitUntil(refreshAllCaches(env));
+    if (event.cron === '*/10 * * * *') {
+      ctx.waitUntil(refreshAllCaches(env, 'instagram'));
+    } else if (event.cron === '0 * * * *') {
+      ctx.waitUntil(refreshAllCaches(env, 'xiaohongshu'));
     }
   }
 };

@@ -13,9 +13,9 @@ database_name = "social-rss-bridge-db"
 database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
-# Cron Triggers — 每小时刷新缓存
+# Cron Triggers — Instagram 每10分钟刷新，小红书每小时刷新
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/10 * * * *", "0 * * * *"]
 
 [vars]
 API_USAGE_ALERT_THRESHOLD = "200"
