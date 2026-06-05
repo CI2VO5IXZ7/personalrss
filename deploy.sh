@@ -25,7 +25,7 @@ source <(grep -v '^\s*#' .env | grep -v '^\s*$')
 set +a
 
 # 校验必要变量
-REQUIRED_VARS="TIKHUB_API_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_TOKEN"
+REQUIRED_VARS="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_TOKEN"
 MISSING=""
 for var in $REQUIRED_VARS; do
   if [ -z "${!var}" ]; then
@@ -100,7 +100,6 @@ upsert_wrangler_var "CACHE_TTL_MINUTES" "${CACHE_TTL_MINUTES:-60}"
 upsert_wrangler_var "CACHE_MAX_POSTS" "${CACHE_MAX_POSTS:-100}"
 upsert_wrangler_var "REFRESH_CONCURRENCY" "${REFRESH_CONCURRENCY:-3}"
 upsert_wrangler_var "FAILURE_ALERT_THRESHOLD" "${FAILURE_ALERT_THRESHOLD:-3}"
-upsert_wrangler_var "API_USAGE_ALERT_THRESHOLD" "${API_USAGE_ALERT_THRESHOLD:-500}"
 echo "  ✅ 已同步 wrangler.toml [vars]"
 
 # ─── 3. 创建 D1 数据库 ────────────────────────────────────────────────────────
@@ -197,7 +196,6 @@ set_secret() {
   fi
 }
 
-set_secret "TIKHUB_API_TOKEN" "$TIKHUB_API_TOKEN"
 set_secret "TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN"
 set_secret "TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID"
 set_secret "ADMIN_TOKEN" "$ADMIN_TOKEN"
@@ -237,7 +235,6 @@ if [ -n "$WORKER_URL" ]; then
   echo ""
   echo "🤖 Telegram Bot 命令:"
   echo "   /add_ig <username> [displayName]  — 添加 Instagram 订阅"
-  echo "   /add_xhs <userId> [displayName]   — 添加小红书订阅"
   echo "   /list                              — 列出所有订阅"
   echo "   /feeds                             — 查看 RSS 链接"
   echo "   /help                              — 显示所有命令"

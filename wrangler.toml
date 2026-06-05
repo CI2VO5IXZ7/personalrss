@@ -13,12 +13,11 @@ database_name = "social-rss-bridge-db"
 database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
-# Cron Triggers — Instagram 每10分钟刷新，小红书每小时刷新
+# Cron Triggers — Instagram 每10分钟刷新
 [triggers]
-crons = ["*/10 * * * *", "0 * * * *"]
+crons = ["*/10 * * * *"]
 
 [vars]
-API_USAGE_ALERT_THRESHOLD = "200"
 FAILURE_ALERT_THRESHOLD = "10"
 REFRESH_CONCURRENCY = "30"
 CACHE_MAX_POSTS = "100"
@@ -41,7 +40,6 @@ persist = true
 head_sampling_rate = 1
 
 # Secrets (通过 wrangler secret put 设置，不进代码仓库):
-# TIKHUB_API_TOKEN    - TikHub API Bearer Token (小红书数据抓取)
 # TELEGRAM_BOT_TOKEN  - Telegram Bot Token
 # TELEGRAM_CHAT_ID    - Telegram 接收消息的 Chat ID
 # ADMIN_TOKEN         - 管理接口鉴权 Token
