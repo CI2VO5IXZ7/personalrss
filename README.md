@@ -1,23 +1,20 @@
 # Social RSS Bridge
 
-将 Instagram 和小红书账号内容转成 RSS 2.0 Feed，运行在 Cloudflare Workers 上，并通过 Telegram Bot 完成订阅管理、状态查看和运维操作。
+将 Instagram 账号内容转成 RSS 2.0 Feed，运行在 Cloudflare Workers 上，并通过 Telegram Bot 完成订阅管理、状态查看和运维操作。
 
 ## 当前功能
 
 - Instagram RSS：抓取公开账号主页内容并输出 RSS。
-- 小红书 RSS：通过 TikHub API 抓取账号笔记，并区分图文/视频详情接口。
-- 增量抓取：每轮小红书刷新只先调用 `get_user_posted_notes`；只有发现新笔记时，才按类型调用详情接口。
 - 缓存去重：基于 `canonical_id`、`content_hash`、`media_type` 去重，减少历史别名 ID 导致的重复条目。
 - 媒体代理：图片和视频分别通过 `/img`、`/media` 代理，避免直链失效。
 - Telegram Bot 管理：支持添加、删除、刷新、清缓存、查看状态、查看 RSS 链接。
 - Telegram 命令菜单同步：支持把机器人命令菜单同步为当前代码中的完整命令集。
 - 抓取状态与告警：记录最近成功/失败、连续失败次数、最近错误，并在达到阈值时发送 Telegram 告警。
-- 定时刷新：Cloudflare Cron 每小时刷新一次全部订阅缓存。
+- 定时刷新：Cloudflare Cron 每 10 分钟刷新一次全部订阅缓存。
 
 ## 运行要求
 
 - Cloudflare Workers + D1
-- TikHub API Token
 - Telegram Bot Token
 - Node.js 20
 
@@ -33,7 +30,6 @@
 Cloudflare Worker
 ├─ Hono 路由
 ├─ Instagram 抓取
-├─ TikHub 小红书抓取
 ├─ D1
 │  ├─ accounts
 │  ├─ posts_cache
@@ -69,7 +65,6 @@ Cloudflare Worker
 | `CACHE_MAX_POSTS` | 否 | `100` | 每个账号在 `posts_cache` 中最多保留的帖子数量 |
 | `REFRESH_CONCURRENCY` | 否 | `3` | 全量刷新时的并发账号数 |
 | `FAILURE_ALERT_THRESHOLD` | 否 | `3` | 连续失败达到该次数后发送 Telegram 告警 |
-| `API_USAGE_ALERT_THRESHOLD` | 否 | `500` | TikHub 单日调用量达到阈值时发送 Telegram 告警，`0` 表示关闭 |
 
 ### 3. Worker Secrets
 
@@ -77,7 +72,6 @@ Cloudflare Worker
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `TIKHUB_API_TOKEN` | 小红书功能必填 | TikHub Bearer Token |
 | `TELEGRAM_BOT_TOKEN` | Telegram 功能必填 | Telegram Bot Token |
 | `TELEGRAM_CHAT_ID` | Telegram 功能必填 | 允许操作机器人的目标 Chat ID |
 | `ADMIN_TOKEN` | 是 | 管理接口认证 Token，同时也作为 Telegram Webhook Secret Token |
@@ -135,7 +129,6 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/rss/ig/:username` | Instagram RSS |
-| `GET` | `/rss/xhs/:userId` | 小红书 RSS |
 | `GET` | `/img?url=...` | 图片代理 |
 | `GET` | `/media?url=...` | 视频代理 |
 
@@ -164,9 +157,7 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | 命令 | 说明 |
 | --- | --- |
 | `/add_ig <username> [displayName]` | 添加 Instagram 订阅 |
-| `/add_xhs <userId> [displayName]` | 添加小红书订阅 |
 | `/remove_ig <username>` | 删除 Instagram 订阅 |
-| `/remove_xhs <userId>` | 删除小红书订阅 |
 | `/list` | 列出当前全部订阅 |
 
 ### 运维命令
@@ -175,12 +166,9 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | --- | --- |
 | `/feeds` | 列出所有 RSS 链接 |
 | `/status` | 查看服务状态、抓取摘要和异常账号 |
-| `/api_usage [days]` | 查看近 N 天 TikHub API 调用量 |
 | `/refresh` | 手动刷新全部缓存 |
 | `/refresh_ig <username>` | 刷新单个 Instagram 订阅 |
-| `/refresh_xhs <userId>` | 刷新单个小红书订阅 |
 | `/purge_ig` | 清理全部 Instagram 缓存 |
-| `/purge_xhs <userId>` | 清理单个小红书缓存 |
 | `/sync_commands` | 同步 Telegram 机器人命令菜单 |
 | `/help` | 显示帮助 |
 | `/start` | 显示帮助 |
@@ -191,14 +179,6 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 
 - RSS 请求优先读取缓存。
 - 缓存过期或为空时，后台异步刷新。
-
-### 小红书
-
-- 每轮刷新先调用一次 `get_user_posted_notes`。
-- 只对新笔记调用详情接口。
-- `type=video` 使用 `get_video_note_detail`。
-- 其他类型默认使用 `get_image_note_detail`。
-- 详情接口失败时，会回退到列表数据，避免整条笔记完全丢失。
 
 ### 去重与裁剪
 
@@ -223,8 +203,6 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 - 最近耗时
 
 当连续失败次数达到 `FAILURE_ALERT_THRESHOLD` 时，会向 Telegram 发送告警。
-
-当 TikHub 当日调用量达到 `API_USAGE_ALERT_THRESHOLD` 时，也会发送告警。
 
 ## 本地开发与检查
 
@@ -294,11 +272,9 @@ curl -X POST "https://<your-worker-domain>/admin/sync-telegram-commands" \
 
 ```txt
 /add_ig Silencewang.0917 汪苏泷的ins
-/add_xhs 62b97a76000000001b02b560 罗曼城氛围组
 ```
 
 ## 说明
 
 - 只有已加入白名单的账号才允许通过 RSS 接口访问。
 - RSS 页面本身不再提供公开索引页。
-- 小红书抓取依赖 TikHub；如果上游返回异常，系统会记录失败并参与告警计数。

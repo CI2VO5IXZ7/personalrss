@@ -1,17 +1,11 @@
 // D1 Database operations for Social RSS Bridge
 
-import { stripHtml } from './html.js';
-
 function safeParseJson(value, fallback) {
   try {
     return JSON.parse(value || '');
   } catch {
     return fallback;
   }
-}
-
-function normalizeWhitespace(value = '') {
-  return String(value).replace(/\s+/g, ' ').trim();
 }
 
 function isCaseInsensitivePlatform(platform) {
@@ -38,16 +32,6 @@ function toSecondBucket(date) {
   return String(Math.floor(time / 1000));
 }
 
-function extractAssetSignature(url) {
-  if (!url) return '';
-  try {
-    const parsed = new URL(url);
-    return parsed.pathname.split('/').filter(Boolean).slice(-2).join('/');
-  } catch {
-    return '';
-  }
-}
-
 function inferMediaType(post) {
   if (post.media_type) return post.media_type;
   if ((post.description || '').includes('<video')) return 'video';
@@ -55,14 +39,7 @@ function inferMediaType(post) {
 }
 
 export function buildContentHash(platform, userId, post) {
-  const titleSeed = normalizeWhitespace(post.title || stripHtml(post.description || '').split('\n')[0] || '').toLowerCase();
   const dateSeed = toSecondBucket(post.date);
-  const assetSeed = extractAssetSignature(post.image || post.raw_images?.[0] || '');
-
-  if (platform === 'xhs') {
-    return `xhs:${hashString(`${userId}|${titleSeed}|${dateSeed}|${assetSeed}`)}`;
-  }
-
   return `${platform}:${hashString(`${userId}|${post.link || post.id || ''}|${dateSeed}`)}`;
 }
 
@@ -167,26 +144,16 @@ export async function addAccount(db, platform, userId, displayName = '') {
 
 export async function removeAccount(db, platform, userId) {
   try {
-    const cachePlatform = platform === 'instagram' ? 'ig' : 'xhs';
+    const cachePlatform = 'ig';
     const normalizedUserId = normalizeUserId(platform, userId);
-    let result;
 
-    if (isCaseInsensitivePlatform(platform)) {
-      result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND LOWER(user_id) = ?')
-        .bind(platform, normalizedUserId).run();
-    } else {
-      result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND user_id = ?')
-        .bind(platform, normalizedUserId).run();
-    }
+    const result = await db.prepare('DELETE FROM accounts WHERE platform = ? AND LOWER(user_id) = ?')
+      .bind(platform, normalizedUserId).run();
 
     await clearCachedPosts(db, cachePlatform, userId);
-    if (isCaseInsensitivePlatform(cachePlatform)) {
-      await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND LOWER(user_id) = ?')
-        .bind(cachePlatform, normalizeUserId(cachePlatform, userId)).run().catch(() => {});
-    } else {
-      await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND user_id = ?')
-        .bind(cachePlatform, normalizeUserId(cachePlatform, userId)).run().catch(() => {});
-    }
+    await db.prepare('DELETE FROM crawl_status WHERE platform = ? AND LOWER(user_id) = ?')
+      .bind(cachePlatform, normalizeUserId(cachePlatform, userId)).run().catch(() => {});
+
     return result.meta.changes > 0;
   } catch (e) {
     console.error('[db] removeAccount error:', e.message);
@@ -270,9 +237,7 @@ export async function dedupeCachedPosts(db, platform, userId) {
     for (const row of rows) {
       const post = rowToPost(row);
       const enriched = enrichPostForStorage(platform, userId, post);
-      const key = platform === 'xhs'
-        ? enriched.content_hash
-        : (enriched.canonical_id || row.post_id);
+      const key = enriched.canonical_id || row.post_id;
 
       if (!key) continue;
 
@@ -535,44 +500,6 @@ export async function setSetting(db, key, value) {
   try {
     await db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind(key, value).run();
   } catch (e) { console.error('[db] setSetting error:', e.message); }
-}
-
-// ─── API Usage Tracking ─────────────────────────────────────────────────────
-
-export async function trackApiCall(db, endpoint) {
-  try {
-    // 使用北京时间日期
-    const now = new Date(Date.now() + 8 * 3600 * 1000);
-    const date = now.toISOString().slice(0, 10);
-    await db.prepare(
-      `INSERT INTO api_usage (date, endpoint, calls) VALUES (?, ?, 1)
-       ON CONFLICT(date, endpoint) DO UPDATE SET calls = calls + 1`
-    ).bind(date, endpoint).run();
-  } catch (e) {
-    console.error('[db] trackApiCall error:', e.message);
-  }
-}
-
-export async function getApiUsage(db, days = 7) {
-  try {
-    const now = new Date(Date.now() + 8 * 3600 * 1000);
-    const since = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
-    const { results } = await db.prepare(
-      `SELECT date, endpoint, calls FROM api_usage WHERE date >= ? ORDER BY date DESC, endpoint`
-    ).bind(since).all();
-    return results || [];
-  } catch { return []; }
-}
-
-export async function getApiUsageSummary(db, days = 7) {
-  try {
-    const now = new Date(Date.now() + 8 * 3600 * 1000);
-    const since = new Date(now.getTime() - days * 86400000).toISOString().slice(0, 10);
-    const { results } = await db.prepare(
-      `SELECT date, SUM(calls) as total_calls FROM api_usage WHERE date >= ? GROUP BY date ORDER BY date DESC`
-    ).bind(since).all();
-    return results || [];
-  } catch { return []; }
 }
 
 // ─── Helper: convert cached rows to RSS post objects ─────────────────────────

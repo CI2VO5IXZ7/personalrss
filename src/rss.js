@@ -107,19 +107,3 @@ ${buildItemsXml(posts, baseUrl)}
   </channel>
 </rss>`;
 }
-
-export function generateXhsFeed(userId, displayName, posts, baseUrl) {
-  const feedUrl = `${baseUrl}/rss/xhs/${userId}`;
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom">
-  <channel>
-    <title><![CDATA[${displayName || userId} - 小红书]]></title>
-    <link>https://www.xiaohongshu.com/user/profile/${userId}</link>
-    <description><![CDATA[小红书用户 ${displayName || userId} 的笔记]]></description>
-    <language>zh-CN</language>
-    <atom:link href="${escapeXml(feedUrl)}" rel="self" type="application/rss+xml"/>
-    <lastBuildDate>${toBeijingRFC822(new Date())}</lastBuildDate>
-${buildItemsXml(posts, baseUrl)}
-  </channel>
-</rss>`;
-}

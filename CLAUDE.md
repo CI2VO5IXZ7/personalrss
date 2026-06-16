@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-**personalrss** (package name: `social-rss-bridge`) is a Cloudflare Workers application that converts Instagram and Xiaohongshu (Little Red Book / 小红书) social media profiles into RSS 2.0 feeds, with a Telegram Bot interface for subscription management.
+**personalrss** (package name: `social-rss-bridge`) is a Cloudflare Workers application that converts Instagram social media profiles into RSS 2.0 feeds, with a Telegram Bot interface for subscription management.
+
+> Note: Xiaohongshu (小红书 / TikHub) support has been removed. Only Instagram remains. The `accounts.platform` / `posts_cache.platform` columns and a few historical migrations (e.g. `0003_api_usage.sql`) still exist for backward compatibility but are no longer exercised.
 
 **Runtime**: Cloudflare Workers (edge serverless, V8 isolates)
 **Language**: JavaScript ES Modules
@@ -17,7 +19,7 @@
 ```
 src/
   index.js              # Main Hono app: HTTP routes, cron handler, Telegram command dispatch
-  db.js                 # All D1 database operations (accounts, posts cache, crawl status, API usage)
+  db.js                 # All D1 database operations (accounts, posts cache, crawl status)
   rss.js                # RSS 2.0 XML generation (Hono XML response, Beijing timezone)
   telegram.js           # Telegram Bot API HTTP wrappers (sendMessage, setWebhook, etc.)
   telegram_commands.js  # Bot command definitions and /help builder
@@ -26,12 +28,11 @@ src/
   html.js               # escapeHtml, stripHtml utilities
   crawlers/
     instagram.js        # Instagram scraper (unofficial internal API, no auth)
-    xhs_tikhub.js       # Xiaohongshu scraper via TikHub API (incremental fetching)
 
 migrations/
   0001_init.sql                        # Initial schema (accounts, posts_cache, settings)
   0002_fix_unique_constraint.sql       # Add user_id to posts_cache unique key
-  0003_api_usage.sql                   # api_usage table for TikHub call tracking
+  0003_api_usage.sql                   # api_usage table (legacy, no longer written to)
   0004_post_meta_and_crawl_status.sql  # canonical_id, content_hash, media_type; crawl_status table
 
 .github/workflows/deploy.yml  # Manual GitHub Actions deploy (workflow_dispatch only)
@@ -55,7 +56,7 @@ npm run tail         # Stream live worker logs (wrangler tail)
 
 There are **no tests** and **no linter** configured. `npm run check` (dry-run) is the closest to validation.
 
-**Local dev note**: The worker requires secrets (`TIKHUB_API_TOKEN`, `TELEGRAM_BOT_TOKEN`, etc.) in a `.dev.vars` file (copy from `.dev.vars.example`). The D1 database is auto-created locally by `wrangler dev --local`.
+**Local dev note**: The worker requires secrets (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ADMIN_TOKEN`) in a `.dev.vars` file (copy from `.dev.vars.example`). The D1 database is auto-created locally by `wrangler dev --local`.
 
 ---
 
@@ -63,12 +64,12 @@ There are **no tests** and **no linter** configured. `npm run check` (dry-run) i
 
 ### Request Flow
 
-1. **RSS endpoint** (`GET /rss/ig/:username`, `GET /rss/xhs/:userId`):
+1. **RSS endpoint** (`GET /rss/ig/:username`):
    - Account must be in the whitelist (D1 `accounts` table)
    - Returns cached posts immediately
    - Triggers background refresh if cache is stale (`CACHE_TTL_MINUTES`)
 
-2. **Cron trigger** (`0 * * * *`): Refreshes all whitelisted accounts in parallel (bounded by `REFRESH_CONCURRENCY`)
+2. **Cron trigger** (`*/10 * * * *`): Refreshes all whitelisted accounts in parallel (bounded by `REFRESH_CONCURRENCY`)
 
 3. **Telegram webhook** (`POST /telegram`): Handles subscription commands from the authorized chat only
 
@@ -77,19 +78,15 @@ There are **no tests** and **no linter** configured. `npm run check` (dry-run) i
 Posts are deduplicated across three dimensions before insert:
 - `canonical_id` — platform-native ID
 - `content_hash` — SHA-256 of `title + link`
-- `media_type` — `image` | `video` (XHS distinguishes these)
+- `media_type` — `image` | `video`
 
 The cache is trimmed to `CACHE_MAX_POSTS` newest posts per account after each refresh.
-
-### Incremental Fetching (XHS)
-
-`xhs_tikhub.js` tracks the newest known post per account and only fetches pages until it encounters an already-seen post, avoiding redundant API calls.
 
 ### Media Proxy
 
 All images and videos in generated RSS feeds are routed through `/img` and `/media` proxy endpoints. This:
 - Prevents dead links if the CDN URL changes
-- Bypasses hotlink protection on Instagram/Xiaohongshu CDNs
+- Bypasses hotlink protection on Instagram CDNs
 - Supports HTTP Range requests for video streaming
 
 The proxy enforces a host whitelist — only approved CDN domains are proxied.
@@ -102,7 +99,7 @@ The proxy enforces a host whitelist — only approved CDN domains are proxied.
 | Column | Type | Notes |
 |---|---|---|
 | id | INTEGER PK | |
-| platform | TEXT | `instagram` or `xiaohongshu` |
+| platform | TEXT | `instagram` (XHS removed) |
 | user_id | TEXT | Platform-native user identifier |
 | display_name | TEXT | Human-readable label |
 | created_at | TEXT | ISO timestamp |
@@ -134,7 +131,7 @@ Tracks per-account crawl health:
 - `last_error`, `last_error_at`, `last_duration_ms`, etc.
 
 ### `api_usage`
-Tracks daily TikHub API call counts per endpoint. Alerts when `calls > API_USAGE_ALERT_THRESHOLD`.
+Legacy table from the removed TikHub/XHS integration. No longer written to or read by the application code.
 
 ---
 
@@ -149,13 +146,11 @@ Tracks daily TikHub API call counts per endpoint. Alerts when `calls > API_USAGE
 | `CACHE_MAX_POSTS` | `100` | Max posts retained per account in D1 |
 | `REFRESH_CONCURRENCY` | `3` | Max simultaneous account refreshes |
 | `FAILURE_ALERT_THRESHOLD` | `3` | Consecutive crawl failures before Telegram alert |
-| `API_USAGE_ALERT_THRESHOLD` | `500` | Daily TikHub calls before usage alert |
 
 ### Secrets (set via `wrangler secret put` or `deploy.sh`)
 
 | Secret | Description |
 |---|---|
-| `TIKHUB_API_TOKEN` | TikHub Bearer token for Xiaohongshu API |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Numeric ID of authorized chat (admin only) |
 | `ADMIN_TOKEN` | Token for `/admin/*` HTTP endpoints and webhook verification |
@@ -166,7 +161,6 @@ Tracks daily TikHub API call counts per endpoint. Alerts when `calls > API_USAGE
 
 ### RSS Feeds
 - `GET /rss/ig/:username` — Instagram RSS (account must be in whitelist)
-- `GET /rss/xhs/:userId` — Xiaohongshu RSS (account must be in whitelist)
 
 ### Proxy
 - `GET /img?url=...` — Image proxy (CDN whitelist enforced)
@@ -187,18 +181,13 @@ Tracks daily TikHub API call counts per endpoint. Alerts when `calls > API_USAGE
 | Command | Description |
 |---|---|
 | `/add_ig <username>` | Subscribe to Instagram profile |
-| `/add_xhs <userId>` | Subscribe to Xiaohongshu profile |
 | `/remove_ig <username>` | Remove Instagram subscription |
-| `/remove_xhs <userId>` | Remove Xiaohongshu subscription |
 | `/list` | List all subscribed accounts |
 | `/feeds` | Show RSS feed URLs |
 | `/status` | Show crawl status per account |
-| `/api_usage` | Show today's TikHub API usage |
 | `/refresh` | Force refresh all accounts |
 | `/refresh_ig <username>` | Force refresh one Instagram account |
-| `/refresh_xhs <userId>` | Force refresh one Xiaohongshu account |
-| `/purge_ig <username>` | Delete cached posts for Instagram account |
-| `/purge_xhs <userId>` | Delete cached posts for Xiaohongshu account |
+| `/purge_ig` | Delete all cached Instagram posts |
 | `/sync_commands` | Re-sync bot command menu |
 | `/help` | Show help message |
 
@@ -248,7 +237,7 @@ GitHub Actions workflow (`.github/workflows/deploy.yml`) is manual-trigger only 
 ## Common Tasks
 
 ### Add a new platform crawler
-1. Create `src/crawlers/<platform>.js` following the pattern of `instagram.js` or `xhs_tikhub.js`
+1. Create `src/crawlers/<platform>.js` following the pattern of `instagram.js`
 2. Add account CRUD functions to `db.js` (or reuse existing with a new `platform` value)
 3. Add RSS route in `index.js`
 4. Add Telegram commands in `telegram_commands.js` and handlers in `index.js`
@@ -278,8 +267,7 @@ npm run dev
 
 ## Important Constraints
 
-- **Whitelist enforced**: RSS endpoints return 404 if the account is not in `accounts` table. Add accounts via Telegram `/add_ig` or `/add_xhs` — never bypass the whitelist.
+- **Whitelist enforced**: RSS endpoints return 403 if the account is not in `accounts` table. Add accounts via Telegram `/add_ig` — never bypass the whitelist.
 - **Single authorized chat**: Telegram commands only work from the configured `TELEGRAM_CHAT_ID`. This is intentional — do not add multi-user auth without careful review.
-- **TikHub quota**: XHS scraping uses a paid API (`TIKHUB_API_TOKEN`). Monitor `/api_usage` to avoid overruns. Incremental fetching is critical to keep costs low.
 - **No KV store**: A previous version used Cloudflare KV; it has been fully migrated to D1. Do not reintroduce KV.
 - **Worker CPU limits**: Cloudflare Workers have a 10–50ms CPU time budget per request. Avoid heavy synchronous computation; use `waitUntil` for background work (already done in refresh logic).

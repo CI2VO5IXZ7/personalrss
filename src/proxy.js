@@ -5,10 +5,7 @@ import { logError, logWarn } from './log.js';
 const ALLOWED_HOSTS = [
   'instagram.com',
   'cdninstagram.com',
-  'fbcdn.net',
-  'xhscdn.com',
-  'xhscdn.net',
-  'xiaohongshu.com'
+  'fbcdn.net'
 ];
 
 const PASS_THROUGH_HEADERS = [
@@ -36,17 +33,14 @@ function parseTargetUrl(rawUrl) {
 
 function isLikelyMediaUrl(url) {
   try {
-    return /(\.mp4|\.mov|\.m4v|\.webm|\.m3u8)(\?|$)/i.test(url)
-      || /(?:^|\.)(?:sns-video)/i.test(new URL(url).hostname);
+    return /(\.mp4|\.mov|\.m4v|\.webm|\.m3u8)(\?|$)/i.test(url);
   } catch {
     return false;
   }
 }
 
-function buildReferer(targetUrl) {
-  return targetUrl.hostname.endsWith('instagram.com')
-    ? 'https://www.instagram.com/'
-    : 'https://www.xiaohongshu.com/';
+function buildReferer() {
+  return 'https://www.instagram.com/';
 }
 
 function buildProxyHeaders(upstream, kind) {
@@ -90,7 +84,7 @@ async function handleProxy(c, kind) {
     const headers = new Headers({
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       'Accept': kind === 'image' ? 'image/*,*/*;q=0.8' : 'video/*,*/*;q=0.8',
-      'Referer': buildReferer(targetUrl)
+      'Referer': buildReferer()
     });
 
     if (kind === 'media') {
