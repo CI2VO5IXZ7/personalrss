@@ -14,11 +14,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
-
       - name: Install Dependencies
-        run: pnpm install
+        run: npm ci
 
       - name: Apply D1 Migrations
         uses: cloudflare/wrangler-action@v3
@@ -26,7 +23,7 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: d1 migrations apply social-rss-bridge-db --remote
-          packageManager: pnpm
+          packageManager: npm
 
       - name: Deploy
         uses: cloudflare/wrangler-action@v3
@@ -34,4 +31,4 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
-          packageManager: pnpm
+          packageManager: npm
