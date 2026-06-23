@@ -13,13 +13,13 @@ database_name = "social-rss-bridge-db"
 database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
-# Cron Triggers — Instagram 每10分钟刷新
+# Cron Triggers — Instagram 非公开接口容易对 Cloudflare IP 做 401/429 风控，避免高频刷新
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["*/30 * * * *"]
 
 [vars]
 FAILURE_ALERT_THRESHOLD = "10"
-REFRESH_CONCURRENCY = "30"
+REFRESH_CONCURRENCY = "3"
 CACHE_MAX_POSTS = "100"
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"

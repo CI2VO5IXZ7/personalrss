@@ -1,4 +1,6 @@
-// Instagram 抓取 — 使用官方内部 API（无需登录，CF 网络可直达公开 profile）
+// Instagram 抓取 — 使用官方内部 API。
+// 注意：该接口是非公开接口，Instagram 会对 Cloudflare/机房 IP 做 401/429 风控。
+// 因此这里必须低频、低并发，并对临时风控做短退避重试；不要把失败冒充为空结果。
 
 import { escapeHtml } from '../html.js';
 
@@ -15,6 +17,39 @@ const IG_HEADERS = {
   'sec-fetch-site': 'same-origin',
   'sec-fetch-mode': 'cors'
 };
+
+const RETRYABLE_HTTP_STATUS = new Set([401, 403, 429, 500, 502, 503, 504]);
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt) {
+  // Cloudflare Worker 里不能长时间阻塞；只做短退避，主要错开并发峰值。
+  return 800 * attempt + Math.floor(Math.random() * 500);
+}
+
+async function fetchInstagramJson(url, options, maxAttempts = 3) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const resp = await fetch(url, options);
+
+    if (resp.ok) {
+      return resp.json();
+    }
+
+    lastError = new Error(`Instagram API HTTP ${resp.status}`);
+
+    if (!RETRYABLE_HTTP_STATUS.has(resp.status) || attempt === maxAttempts) {
+      throw lastError;
+    }
+
+    await sleep(retryDelayMs(attempt));
+  }
+
+  throw lastError;
+}
 
 function buildPostDescription(node) {
   const media = node.edge_sidecar_to_children
@@ -47,13 +82,7 @@ function mapNodeToPost(username, node) {
 
 export async function fetchProfile(username) {
   const url = `${IG_BASE}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
-  const resp = await fetch(url, { headers: IG_HEADERS });
-
-  if (!resp.ok) {
-    throw new Error(`Instagram API HTTP ${resp.status}`);
-  }
-
-  const data = await resp.json();
+  const data = await fetchInstagramJson(url, { headers: IG_HEADERS });
   const user = data?.data?.user;
   if (!user) throw new Error('No user data in Instagram API response');
 

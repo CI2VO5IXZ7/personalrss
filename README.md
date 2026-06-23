@@ -10,7 +10,7 @@
 - Telegram Bot 管理：支持添加、删除、刷新、清缓存、查看状态、查看 RSS 链接。
 - Telegram 命令菜单同步：支持把机器人命令菜单同步为当前代码中的完整命令集。
 - 抓取状态与告警：记录最近成功/失败、连续失败次数、最近错误，并在达到阈值时发送 Telegram 告警。
-- 定时刷新：Cloudflare Cron 每 10 分钟刷新一次全部订阅缓存。
+- 定时刷新：Cloudflare Cron 每 30 分钟刷新一次全部订阅缓存，避免 Instagram 对 Cloudflare/机房 IP 高频风控。
 
 ## 运行要求
 
@@ -63,7 +63,7 @@ Cloudflare Worker
 | `BASE_URL` | 建议 | 当前线上域名 | RSS 链接、Webhook 设置、Telegram 输出里使用的基础域名 |
 | `CACHE_TTL_MINUTES` | 否 | `60` | RSS 请求触发后台刷新时的缓存过期分钟数 |
 | `CACHE_MAX_POSTS` | 否 | `100` | 每个账号在 `posts_cache` 中最多保留的帖子数量 |
-| `REFRESH_CONCURRENCY` | 否 | `3` | 全量刷新时的并发账号数 |
+| `REFRESH_CONCURRENCY` | 否 | `3` | 全量刷新时的并发账号数；Instagram 非公开接口容易 401/429，不建议调高 |
 | `FAILURE_ALERT_THRESHOLD` | 否 | `3` | 连续失败达到该次数后发送 Telegram 告警 |
 
 ### 3. Worker Secrets
