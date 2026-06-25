@@ -36,6 +36,37 @@ function failureAlertThreshold(env) {
   return Math.max(1, parseInt(env.FAILURE_ALERT_THRESHOLD || '3', 10));
 }
 
+function fallbackFailureThreshold(env) {
+  return Math.max(1, parseInt(env.FALLBACK_REFRESH_FAILURE_THRESHOLD || '3', 10));
+}
+
+function fallbackHttpStatuses(env) {
+  const raw = env.FALLBACK_REFRESH_HTTP_STATUSES || '401,403,429';
+  return new Set(
+    String(raw)
+      .split(',')
+      .map(s => parseInt(s.trim(), 10))
+      .filter(n => Number.isFinite(n))
+  );
+}
+
+function httpFallbackEnabled(env) {
+  const v = env.ENABLE_HTTP_FALLBACK_REFRESH;
+  if (v === undefined || v === null || v === '') return true;
+  return String(v).toLowerCase() === 'true' || String(v) === '1';
+}
+
+// 从抓取错误信息中解析 Instagram HTTP 状态码（形如 "Instagram API HTTP 401"）。
+function extractInstagramHttpStatus(message) {
+  const m = /Instagram API HTTP (\d+)/.exec(message || '');
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function fallbackUrlBase(env) {
+  const raw = env.FALLBACK_REFRESH_URL_BASE || env.BASE_URL || '';
+  return String(raw).replace(/\/+$/, '');
+}
+
 function rssResponse(xml) {
   return new Response(xml, {
     headers: {
@@ -46,6 +77,10 @@ function rssResponse(xml) {
 }
 
 function getAdminTokenFromRequest(c) {
+  // 内部 Worker 自调用使用自定义头，避免依赖 Authorization 在自调用路径上的保留行为。
+  const internal = c.req.header('X-PersonalRSS-Admin-Token');
+  if (internal) return internal.trim();
+
   const header = c.req.header('Authorization') || '';
   if (header.startsWith('Bearer ')) return header.slice(7).trim();
   return header.trim();
@@ -129,13 +164,72 @@ async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
-async function refreshInstagramAccount(env, account) {
+// 触发一次受保护的 HTTP 兜底刷新：通过公网 Worker URL 调用单账号刷新接口。
+// 之所以走 HTTP，是因为 Cloudflare Worker 无法强制固定 colo/placement，
+// 通过公网入口再次进入可能会经由不同的请求路径/落点，从而绕开当前 colo 的 IG 风控。
+// 这是 best-effort，不保证一定换到更好的落点。
+async function attemptHttpFallbackRefresh(env, account, { reason } = {}) {
+  const username = account.user_id;
+  const base = fallbackUrlBase(env);
+
+  if (!base) {
+    return { ok: false, reached: false, error: 'no BASE_URL/FALLBACK_REFRESH_URL_BASE configured' };
+  }
+  if (!env.ADMIN_TOKEN) {
+    return { ok: false, reached: false, error: 'no ADMIN_TOKEN configured' };
+  }
+
+  const url = `${base}/admin/refresh_ig/${encodeURIComponent(username)}?fallback=1`;
+
+  // 注意：不要记录 Authorization 头或 token。
+  logWarn('refresh.account.fallback_request', { id: username, reason: reason || null });
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.ADMIN_TOKEN}`,
+        'X-PersonalRSS-Admin-Token': env.ADMIN_TOKEN,
+        'X-PersonalRSS-Fallback': '1'
+      }
+    });
+
+    if (!resp.ok) {
+      return { ok: false, reached: false, error: `fallback request HTTP ${resp.status}` };
+    }
+
+    let body;
+    try {
+      body = await resp.json();
+    } catch {
+      return { ok: false, reached: false, error: 'fallback response not JSON' };
+    }
+
+    const result = body?.result || null;
+    if (!result) {
+      return { ok: false, reached: false, error: 'fallback response missing result' };
+    }
+
+    // reached=true 表示兜底路由确实执行了刷新（成功或失败均已记录到 crawl_status）。
+    return { ok: !!result.ok, reached: true, result };
+  } catch (e) {
+    return { ok: false, reached: false, error: truncate(e?.message || 'fallback request failed', 200) };
+  }
+}
+
+async function refreshInstagramAccount(env, account, options = {}) {
+  const {
+    allowHttpFallback = true,
+    source = 'unknown',
+    colo = null
+  } = options;
+
   const db = env.DB;
   const startedAt = Date.now();
   const cachePlatform = 'ig';
   const userId = account.user_id;
 
-  logInfo('refresh.account.start', { platform: cachePlatform, userId });
+  logInfo('refresh.account.start', { platform: cachePlatform, userId, source, colo });
 
   try {
     const { posts, meta } = await fetchIg(userId);
@@ -162,13 +256,81 @@ async function refreshInstagramAccount(env, account) {
       newCount: writeResult.newCount,
       dedupedCount: writeResult.dedupedCount,
       trimmedCount: writeResult.trimmedCount,
-      durationMs
+      durationMs,
+      source,
+      colo
     };
 
     logInfo('refresh.account.success', result);
     return result;
   } catch (e) {
     const durationMs = Date.now() - startedAt;
+    const httpStatus = extractInstagramHttpStatus(e.message);
+
+    // 判定是否符合 HTTP 兜底条件：命中配置的风控状态码，且把本次失败计入后达到阈值。
+    if (
+      allowHttpFallback &&
+      httpFallbackEnabled(env) &&
+      httpStatus !== null &&
+      fallbackHttpStatuses(env).has(httpStatus)
+    ) {
+      const previous = await getCrawlStatus(db, cachePlatform, userId);
+      const projectedFailures = (previous?.consecutive_failures || 0) + 1;
+      const threshold = fallbackFailureThreshold(env);
+
+      if (projectedFailures >= threshold) {
+        const fallbackReason = `Instagram API HTTP ${httpStatus} (consecutive=${projectedFailures}>=${threshold})`;
+        logWarn('refresh.account.fallback_attempt', {
+          platform: cachePlatform, id: userId, source, httpStatus, projectedFailures, threshold
+        });
+
+        const fb = await attemptHttpFallbackRefresh(env, account, { reason: fallbackReason });
+
+        if (fb.reached) {
+          // 兜底路由已执行刷新（内部已记录成功/失败一次），直接采用其结果，避免重复计数。
+          const innerResult = fb.result || {};
+          const merged = {
+            ...innerResult,
+            platform: cachePlatform,
+            id: userId,
+            source,
+            colo,
+            fallbackAttempted: true,
+            fallbackReason,
+            viaHttpFallback: true
+          };
+          if (fb.ok) {
+            logInfo('refresh.account.fallback_success', merged);
+          } else {
+            logWarn('refresh.account.fallback_failed', merged);
+          }
+          return merged;
+        }
+
+        // 兜底请求未能到达刷新路由（网络/鉴权等问题）：按原始失败正常记录一次。
+        await markCrawlFailure(db, cachePlatform, userId, { error: e.message, durationMs });
+        const status = await getCrawlStatus(db, cachePlatform, userId);
+        await maybeSendFailureAlert(env, status);
+
+        const result = {
+          platform: cachePlatform,
+          id: userId,
+          ok: false,
+          state: 'error',
+          error: e.message,
+          durationMs,
+          source,
+          colo,
+          fallbackAttempted: true,
+          fallbackReason,
+          fallbackError: fb.error || 'fallback request failed'
+        };
+        logError('refresh.account.failed', result);
+        return result;
+      }
+    }
+
+    // 普通失败路径。
     await markCrawlFailure(db, cachePlatform, userId, {
       error: e.message,
       durationMs
@@ -182,7 +344,10 @@ async function refreshInstagramAccount(env, account) {
       ok: false,
       state: 'error',
       error: e.message,
-      durationMs
+      durationMs,
+      source,
+      colo,
+      fallbackAttempted: false
     };
 
     logError('refresh.account.failed', result);
@@ -190,20 +355,27 @@ async function refreshInstagramAccount(env, account) {
   }
 }
 
-async function refreshAllCaches(env) {
+async function refreshAllCaches(env, options = {}) {
+  const { source = 'cron', allowHttpFallback = true } = options;
   const db = env.DB;
   const igAccounts = await getAccountsByPlatform(db, 'instagram');
 
   logInfo('refresh.batch.start', {
     totalAccounts: igAccounts.length,
-    concurrency: refreshConcurrency(env)
+    concurrency: refreshConcurrency(env),
+    source
   });
 
-  const results = await runWithConcurrency(igAccounts, refreshConcurrency(env), account => refreshInstagramAccount(env, account));
+  const results = await runWithConcurrency(
+    igAccounts,
+    refreshConcurrency(env),
+    account => refreshInstagramAccount(env, account, { source, allowHttpFallback })
+  );
 
   logInfo('refresh.batch.finish', {
     totalAccounts: igAccounts.length,
-    failures: results.filter(r => !r.ok).length
+    failures: results.filter(r => !r.ok).length,
+    source
   });
 
   return results;
@@ -300,8 +472,32 @@ app.post('/admin/refresh', async c => {
   const unauthorized = requireAdmin(c);
   if (unauthorized) return unauthorized;
 
-  const results = await refreshAllCaches(c.env);
+  const results = await refreshAllCaches(c.env, { source: 'admin', allowHttpFallback: true });
   return c.json({ refreshed: results });
+});
+
+// ─── Admin: 单账号刷新 ────────────────────────────────────────────────────────
+// 既可用于手动测试，也是 HTTP 兜底刷新的内部目标路由。
+// 这里关闭 allowHttpFallback 以避免递归（兜底路由再次触发兜底）。
+app.post('/admin/refresh_ig/:username', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
+  const { username } = c.req.param();
+  const account = await getAccount(c.env.DB, 'instagram', username);
+  if (!account) {
+    return c.json({ ok: false, error: 'Account not in whitelist' }, 404);
+  }
+
+  const colo = c.req.raw.cf?.colo || null;
+  const isFallback = c.req.query('fallback') === '1';
+  const result = await refreshInstagramAccount(c.env, account, {
+    allowHttpFallback: false,
+    source: isFallback ? 'http-fallback' : 'http-admin',
+    colo
+  });
+
+  return c.json({ result, colo });
 });
 
 // ─── Admin: Instagram 探针诊断（只读，不写缓存）─────────────────────────────────
@@ -506,7 +702,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
 
       case 'refresh': {
         await sendMessage(token, chatId, '🔄 正在刷新全部缓存...');
-        const results = await refreshAllCaches(env);
+        const results = await refreshAllCaches(env, { source: 'telegram', allowHttpFallback: true });
         const hasNew = results.some(r => r.ok && (r.newCount || 0) > 0);
         let msg = '✅ <b>缓存刷新完成</b>\n\n';
         msg += results.map(describeRefreshState).join('\n');
@@ -527,7 +723,7 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
         }
         const canonicalUsername = account.user_id;
         await sendMessage(token, chatId, `🔄 正在刷新 IG <code>${escapeHtml(canonicalUsername)}</code>...`);
-        const result = await refreshInstagramAccount(env, account);
+        const result = await refreshInstagramAccount(env, account, { source: 'telegram', allowHttpFallback: true });
         await sendMessage(token, chatId, describeRefreshState(result));
         break;
       }
@@ -570,6 +766,6 @@ export default {
 
   async scheduled(event, env, ctx) {
     logInfo('scheduled.triggered', { cron: event.cron });
-    ctx.waitUntil(refreshAllCaches(env));
+    ctx.waitUntil(refreshAllCaches(env, { source: 'cron', allowHttpFallback: true }));
   }
 };

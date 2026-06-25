@@ -10,7 +10,8 @@
 - Telegram Bot 管理：支持添加、删除、刷新、清缓存、查看状态、查看 RSS 链接。
 - Telegram 命令菜单同步：支持把机器人命令菜单同步为当前代码中的完整命令集。
 - 抓取状态与告警：记录最近成功/失败、连续失败次数、最近错误，并在达到阈值时发送 Telegram 告警。
-- 定时刷新：Cloudflare Cron 每 30 分钟刷新一次全部订阅缓存，避免 Instagram 对 Cloudflare/机房 IP 高频风控。
+- 定时刷新：Cloudflare Cron 每 10 分钟刷新一次全部订阅缓存，保证内容时效性。
+- HTTP 兜底刷新：当某账号连续触发 Instagram 401/403/429 风控时，自动通过公网 Worker URL 再尝试一次受保护的单账号刷新（best-effort）。
 
 ## 运行要求
 
@@ -65,6 +66,10 @@ Cloudflare Worker
 | `CACHE_MAX_POSTS` | 否 | `100` | 每个账号在 `posts_cache` 中最多保留的帖子数量 |
 | `REFRESH_CONCURRENCY` | 否 | `3` | 全量刷新时的并发账号数；Instagram 非公开接口容易 401/429，不建议调高 |
 | `FAILURE_ALERT_THRESHOLD` | 否 | `3` | 连续失败达到该次数后发送 Telegram 告警 |
+| `ENABLE_HTTP_FALLBACK_REFRESH` | 否 | `true` | 是否启用 HTTP 兜底刷新；设为 `false` 可完全关闭 |
+| `FALLBACK_REFRESH_FAILURE_THRESHOLD` | 否 | `3` | 连续命中风控状态码达到该次数后触发一次 HTTP 兜底刷新 |
+| `FALLBACK_REFRESH_HTTP_STATUSES` | 否 | `401,403,429` | 触发兜底的 Instagram HTTP 状态码列表（逗号分隔） |
+| `FALLBACK_REFRESH_URL_BASE` | 否 | 同 `BASE_URL` | 兜底刷新请求使用的基础域名，默认复用 `BASE_URL` |
 
 ### 3. Worker Secrets
 
@@ -139,6 +144,7 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | `POST` | `/telegram` | Telegram Webhook Secret | Telegram Webhook 接收入口 |
 | `POST` | `/setup-webhook` | `Authorization: Bearer <ADMIN_TOKEN>` | 设置 Telegram Webhook，并同步命令菜单 |
 | `POST` | `/admin/refresh` | `Authorization: Bearer <ADMIN_TOKEN>` | 手动刷新全部缓存 |
+| `POST` | `/admin/refresh_ig/:username` | `Authorization: Bearer <ADMIN_TOKEN>` | 刷新单个 Instagram 账号（也是 HTTP 兜底刷新的内部目标） |
 | `POST` | `/admin/sync-telegram-commands` | `Authorization: Bearer <ADMIN_TOKEN>` | 单独同步 Telegram 命令菜单 |
 | `GET` | `/admin/probe-instagram` | `Authorization: Bearer <ADMIN_TOKEN>` | Instagram 探针诊断（只读，不写缓存） |
 
@@ -180,6 +186,16 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 
 - RSS 请求优先读取缓存。
 - 缓存过期或为空时，后台异步刷新。
+
+### 定时刷新与 HTTP 兜底刷新
+
+- 定时刷新：Cron 每 10 分钟刷新一次全部订阅，保证时效性。
+- HTTP 兜底刷新：定时/批量刷新某账号时，如果命中 `FALLBACK_REFRESH_HTTP_STATUSES`（默认 `401,403,429`）且把本次失败计入后连续失败数达到 `FALLBACK_REFRESH_FAILURE_THRESHOLD`（默认 `3`），会自动通过公网 Worker URL（`POST /admin/refresh_ig/<username>?fallback=1`）再尝试一次刷新。
+  - 兜底刷新成功则采用其结果，并且不重复记录本次失败。
+  - 兜底刷新仍然失败则记录该次失败（不会重复计数）。
+  - 兜底请求本身未能到达刷新路由（网络/鉴权问题）时，按原始失败正常记录一次。
+- **局限性**：这是 best-effort。Cloudflare Workers 无法强制固定 colo/placement，通过公网入口再次进入只是「有可能」经由不同的请求路径/落点，从而绕开当前 colo 的 IG 风控，并不保证一定换到更好的落点。
+- 兜底刷新路由本身会关闭再次兜底，避免递归与重复计数。
 
 ### 去重与裁剪
 
@@ -259,6 +275,15 @@ npm run check
 
 ```bash
 curl -X POST "https://<your-worker-domain>/admin/refresh" \
+  -H "Authorization: Bearer TOKEN_PLACEHOLDER"
+```
+
+### 手动刷新单个 Instagram 账号
+
+可用于手动测试，也是 HTTP 兜底刷新的内部目标路由。该路由不会再次触发兜底刷新。
+
+```bash
+curl -X POST "https://<your-worker-domain>/admin/refresh_ig/jjlin" \
   -H "Authorization: Bearer TOKEN_PLACEHOLDER"
 ```
 

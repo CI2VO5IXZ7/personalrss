@@ -13,9 +13,10 @@ database_name = "social-rss-bridge-db"
 database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
-# Cron Triggers — Instagram 非公开接口容易对 Cloudflare IP 做 401/429 风控，避免高频刷新
+# Cron Triggers — 每 10 分钟刷新一次，保证时效性；当某账号连续触发 Instagram
+# 401/403/429 风控时，会再尝试一次受保护的 HTTP 兜底刷新（best-effort，无法强制固定 colo）。
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/10 * * * *"]
 
 [vars]
 FAILURE_ALERT_THRESHOLD = "10"
@@ -23,6 +24,10 @@ REFRESH_CONCURRENCY = "3"
 CACHE_MAX_POSTS = "100"
 CACHE_TTL_MINUTES = "60"
 BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
+# 兜底刷新：连续失败达到该阈值且命中下列状态码时，触发一次 HTTP 兜底刷新
+FALLBACK_REFRESH_FAILURE_THRESHOLD = "3"
+FALLBACK_REFRESH_HTTP_STATUSES = "401,403,429"
+ENABLE_HTTP_FALLBACK_REFRESH = "true"
 
 [observability]
 enabled = false
