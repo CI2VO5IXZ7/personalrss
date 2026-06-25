@@ -3,4 +3,5 @@ node_modules/
 .tools/
 .env
 .dev.vars
+.admin_token.local
 dist/
