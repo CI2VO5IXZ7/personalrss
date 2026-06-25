@@ -12,7 +12,7 @@ import { generateInstagramFeed } from './rss.js';
 import { sendMessage, setWebhook, setMyCommands, parseCommand, verifyWebhookSecret, escapeHtml } from './telegram.js';
 import { buildTelegramHelpMessage, getTelegramBotCommands } from './telegram_commands.js';
 import { handleImageProxy, handleMediaProxy } from './proxy.js';
-import { fetchProfile as fetchIg, validateProfile as validateIg } from './crawlers/instagram.js';
+import { fetchProfile as fetchIg, validateProfile as validateIg, probeProfile as probeIg } from './crawlers/instagram.js';
 import { logError, logInfo, logWarn } from './log.js';
 
 const app = new Hono();
@@ -302,6 +302,60 @@ app.post('/admin/refresh', async c => {
 
   const results = await refreshAllCaches(c.env);
   return c.json({ refreshed: results });
+});
+
+// ─── Admin: Instagram 探针诊断（只读，不写缓存）─────────────────────────────────
+// 用于从不同客户端网络测试 Cloudflare colo/placement 对 Instagram 风控的影响。
+app.get('/admin/probe-instagram', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
+  const username = (c.req.query('username') || '').trim();
+  const colo = c.req.raw.cf?.colo || null;
+  const ray = c.req.header('cf-ray') || null;
+
+  if (!username) {
+    return c.json({ ok: false, error: 'missing username', colo, ray, timestamp: new Date().toISOString() }, 400);
+  }
+
+  logInfo('probe.instagram.start', { username, colo });
+
+  const startedAt = Date.now();
+  let status = null;
+  let sourceCount = null;
+  let ok = false;
+  let error = null;
+
+  try {
+    const result = await probeIg(username);
+    ok = result.ok;
+    status = result.status;
+    sourceCount = result.sourceCount;
+    if (!ok) error = result.error || null;
+  } catch (e) {
+    error = truncate(e?.message || 'probe failed', 200);
+  }
+
+  const durationMs = Date.now() - startedAt;
+
+  if (ok) {
+    logInfo('probe.instagram.finish', { username, status, colo, durationMs });
+  } else {
+    logWarn('probe.instagram.failure', { username, status, colo, durationMs });
+  }
+
+  return c.json({
+    ok,
+    username,
+    status,
+    durationMs,
+    colo,
+    placement: c.req.raw.cf?.placement || null,
+    ray,
+    sourceCount,
+    error,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ─── Telegram Webhook ─────────────────────────────────────────────────────────

@@ -100,3 +100,29 @@ export async function validateProfile(username) {
   const { meta } = await fetchProfile(username);
   return { username, sourceCount: meta.sourceCount };
 }
+
+// 诊断用：单次抓取，不重试，直接暴露原始 HTTP 状态，方便对比不同 Cloudflare colo 的表现。
+// 注意：不要写入任何缓存或抓取状态，仅用于探测。
+export async function probeProfile(username) {
+  const url = `${IG_BASE}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
+  const resp = await fetch(url, { headers: IG_HEADERS });
+
+  if (!resp.ok) {
+    return { ok: false, status: resp.status, sourceCount: null, error: `Instagram API HTTP ${resp.status}` };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, status: resp.status, sourceCount: null, parseError: true, error: 'Failed to parse Instagram response' };
+  }
+
+  const user = data?.data?.user;
+  if (!user) {
+    return { ok: false, status: resp.status, sourceCount: 0, error: 'No user data in Instagram API response' };
+  }
+
+  const edges = user.edge_owner_to_timeline_media?.edges || [];
+  return { ok: true, status: resp.status, sourceCount: edges.length };
+}

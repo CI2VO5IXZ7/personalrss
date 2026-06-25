@@ -140,6 +140,7 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | `POST` | `/setup-webhook` | `Authorization: Bearer <ADMIN_TOKEN>` | 设置 Telegram Webhook，并同步命令菜单 |
 | `POST` | `/admin/refresh` | `Authorization: Bearer <ADMIN_TOKEN>` | 手动刷新全部缓存 |
 | `POST` | `/admin/sync-telegram-commands` | `Authorization: Bearer <ADMIN_TOKEN>` | 单独同步 Telegram 命令菜单 |
+| `GET` | `/admin/probe-instagram` | `Authorization: Bearer <ADMIN_TOKEN>` | Instagram 探针诊断（只读，不写缓存） |
 
 ### 已关闭的公开页面
 
@@ -258,14 +259,23 @@ npm run check
 
 ```bash
 curl -X POST "https://<your-worker-domain>/admin/refresh" \
-  -H "Authorization: Bearer <ADMIN_TOKEN>"
+  -H "Authorization: Bearer TOKEN_PLACEHOLDER"
 ```
 
 ### 单独同步 Telegram 命令菜单
 
 ```bash
 curl -X POST "https://<your-worker-domain>/admin/sync-telegram-commands" \
-  -H "Authorization: Bearer <ADMIN_TOKEN>"
+  -H "Authorization: Bearer TOKEN_PLACEHOLDER"
+```
+
+### Instagram 探针诊断
+
+只读探测，不会写入缓存或修改抓取状态。可从不同客户端网络调用，对比返回的 `colo`、`status` 等字段，判断 Cloudflare 边缘节点/落点是否影响 Instagram 风控。
+
+```bash
+curl -H "Authorization: Bearer TOKEN_PLACEHOLDER" \
+  "https://<your-worker-domain>/admin/probe-instagram?username=jjlin"
 ```
 
 ### 通过 Telegram 添加订阅
