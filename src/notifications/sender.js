@@ -1,7 +1,7 @@
 import { lease, complete, fail } from './queue.js';
 import { sendPhotoWithFallback, sendMessage, TelegramError } from '../telegram.js';
 import { escapeHtml } from '../html.js';
-import { isSafeUrl } from '../security/url.js';
+import { isSafeUrl, redactText } from '../security/url.js';
 
 export function formatRssNotification(payload) {
   const feedTitle = escapeHtml(payload.feedTitle || '');
@@ -35,68 +35,91 @@ export async function processNotificationBatch(db, env, options = {}) {
   const pushToken = env.PUSH_TELEGRAM_BOT_TOKEN;
   const pushChannelId = env.PUSH_TELEGRAM_CHANNEL_ID;
 
-  if (!pushToken || !pushChannelId) {
-    console.error('[sender] PUSH_TELEGRAM_BOT_TOKEN or PUSH_TELEGRAM_CHANNEL_ID not configured');
-    return 0;
-  }
-
-  // Lease pending items
-  const items = await lease(db, limit, maxAttempts, leaseDurationSeconds);
   let processedCount = 0;
 
-  for (const item of items) {
+  for (let i = 0; i < limit; i++) {
+    // Lease exactly one pending item at a time
+    const items = await lease(db, 1, maxAttempts, leaseDurationSeconds);
+    if (!items || items.length === 0) {
+      break;
+    }
+    const item = items[0];
     let success = false;
     let errorMsg = '';
-    let retryAfter = 60; // default backoff
+    let rateLimited = false;
+    let retryAfter = Math.min(60 * Math.pow(2, Math.max(0, item.attempts - 1)), 3600);
 
     try {
       const payload = JSON.parse(item.payload_json);
       
       if (item.kind === 'rss') {
+        if (!pushToken || !pushChannelId) {
+          throw new Error('push Telegram credentials not configured');
+        }
         const text = formatRssNotification(payload);
         const safeImageUrl = payload.imageUrl && isSafeUrl(payload.imageUrl) ? payload.imageUrl : '';
         await sendPhotoWithFallback(pushToken, pushChannelId, safeImageUrl, text, { fetchFn });
         success = true;
       } else if (item.kind === 'stock') {
-        const text = formatStockNotification(payload);
-        await sendMessage(pushToken, pushChannelId, text, 'HTML', { fetchFn });
-        
-        const finalStatus = payload.autoPause ? 'paused' : 'triggered';
-        const nowStr = new Date().toISOString();
-        await db.prepare(
-          `UPDATE tracker_rules
-           SET status = ?, triggered_at = ?, updated_at = ?
-           WHERE id = ? AND status = 'trigger_pending'`
-        ).bind(finalStatus, nowStr, nowStr, payload.ruleId).run();
+        if (!pushToken || !pushChannelId) {
+          throw new Error('push Telegram credentials not configured');
+        }
+        const currentRule = await db.prepare(
+          'SELECT status, arm_version FROM tracker_rules WHERE id = ?'
+        ).bind(payload.ruleId).first();
+        const isCurrentArm = currentRule
+          && currentRule.status === 'trigger_pending'
+          && currentRule.arm_version === payload.armVersion;
 
-        await db.prepare(
-          `INSERT INTO tracker_events (rule_id, event_type, value, observed_at, source, details_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
-        ).bind(
-          payload.ruleId,
-          finalStatus,
-          payload.price,
-          payload.observedAt,
-          payload.source,
-          JSON.stringify({ sent_at: nowStr })
-        ).run();
+        if (!isCurrentArm) {
+          // The rule was removed, rearmed, or otherwise moved on. Complete this
+          // old queue item without delivering a stale alert.
+          success = true;
+        } else {
+          const text = formatStockNotification(payload);
+          await sendMessage(pushToken, pushChannelId, text, 'HTML', { fetchFn });
 
-        success = true;
+          const finalStatus = payload.autoPause ? 'paused' : 'triggered';
+          const nowStr = new Date().toISOString();
+          const updateResult = await db.prepare(
+            `UPDATE tracker_rules
+             SET status = ?, triggered_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'trigger_pending' AND arm_version = ?`
+          ).bind(finalStatus, nowStr, nowStr, payload.ruleId, payload.armVersion).run();
+
+          if (updateResult.meta.changes > 0) {
+            await db.prepare(
+              `INSERT INTO tracker_events (rule_id, event_type, value, observed_at, source, details_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+            ).bind(
+              payload.ruleId,
+              finalStatus,
+              payload.price,
+              payload.observedAt,
+              payload.source,
+              JSON.stringify({ sent_at: nowStr })
+            ).run();
+          }
+
+          success = true;
+        }
       } else if (item.kind === 'system') {
         const text = `⚠️ <b>系统告警</b>\n\n${escapeHtml(payload.message || '')}`;
         const adminToken = env.TELEGRAM_BOT_TOKEN;
         const adminChatId = env.TELEGRAM_CHAT_ID;
-        if (adminToken && adminChatId) {
-          await sendMessage(adminToken, adminChatId, text, 'HTML', { fetchFn });
+        if (!adminToken || !adminChatId) {
+          throw new Error('admin Telegram credentials not configured');
         }
+        await sendMessage(adminToken, adminChatId, text, 'HTML', { fetchFn });
         success = true;
       } else {
         throw new Error(`Unknown notification kind: ${item.kind}`);
       }
     } catch (err) {
-      errorMsg = err.message || 'Unknown error';
+      errorMsg = redactText(err.message || 'Unknown error');
       if (err instanceof TelegramError && err.status === 429) {
-        retryAfter = err.retryAfter || 60;
+        rateLimited = true;
+        retryAfter = err.retryAfter ?? 60;
       }
     }
 
@@ -105,7 +128,7 @@ export async function processNotificationBatch(db, env, options = {}) {
       processedCount++;
     } else {
       await fail(db, item.id, item.lease_token, errorMsg, retryAfter, maxAttempts);
-      if (errorMsg.includes('Too Many Requests') || errorMsg.includes('429')) {
+      if (rateLimited) {
         break;
       }
     }

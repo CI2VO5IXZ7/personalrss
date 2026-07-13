@@ -27,6 +27,10 @@ function extractImageFromHtml(html) {
   return match ? match[1] : '';
 }
 
+function normalizeForHash(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
 export async function parseFeed(xmlContent, subscriptionId) {
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -174,7 +178,11 @@ export async function parseFeed(xmlContent, subscriptionId) {
       entryKey = await sha256(`${subscriptionId || ''}${entryTitle}${entryLink}${publishedAt}`);
     }
 
-    const contentHash = await sha256(content);
+    const normalizedTitle = normalizeForHash(entryTitle);
+    const normalizedContent = normalizeForHash(content);
+    const contentHash = normalizedTitle || normalizedContent
+      ? await sha256(`${normalizedTitle}\n${normalizedContent}`)
+      : '';
 
     return {
       entryKey,

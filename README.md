@@ -80,11 +80,11 @@ Cloudflare Worker
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Telegram 功能必填 | 管理 Bot Token |
 | `TELEGRAM_CHAT_ID` | Telegram 功能必填 | 允许操作管理 Bot 接收消息/命令的目标 Chat ID |
-| `TELEGRAM_ADMIN_USER_ID` | 否 | 管理员的个人 Telegram User ID，配置后限制其他用户在同一 chat 中执行命令 |
+| `TELEGRAM_ADMIN_USER_ID` | Telegram 功能必填 | 唯一允许执行管理命令的个人 Telegram User ID；Webhook 仅接受该用户在私聊中发送的命令，缺失配置时拒绝所有命令 |
 | `ADMIN_TOKEN` | 是 | 管理接口认证 Token，同时也作为 Telegram Webhook Secret Token |
 | `PUSH_TELEGRAM_BOT_TOKEN` | 是 | 专用于向私人频道推送内容的新 Bot Token |
 | `PUSH_TELEGRAM_CHANNEL_ID` | 是 | 接收内容推送的目标私人频道 ID (e.g. -100xxx) |
-| `DEEPSEEK_API_KEY` | 否 | DeepSeek API 密钥，不配置则不进行 AI 摘要生成并使用原摘要 |
+| `DEEPSEEK_API_KEY` | 一键生产部署必填 | DeepSeek API 密钥；`deploy.sh` 会校验并配置为 Worker Secret |
 
 ## 部署
 

@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 export class D1Mock {
   constructor() {
     this.db = new DatabaseSync(':memory:');
+    this.batchTail = Promise.resolve();
   }
 
   exec(sql) {
@@ -15,11 +16,27 @@ export class D1Mock {
   }
 
   async batch(statements) {
-    const results = [];
-    for (const stmt of statements) {
-      results.push(await stmt.run());
+    const previousBatch = this.batchTail;
+    let releaseBatch;
+    this.batchTail = new Promise(resolve => {
+      releaseBatch = resolve;
+    });
+    await previousBatch;
+
+    try {
+      this.db.exec('BEGIN');
+      const results = [];
+      for (const stmt of statements) {
+        results.push(await stmt.run());
+      }
+      this.db.exec('COMMIT');
+      return results;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      releaseBatch();
     }
-    return results;
   }
 }
 
@@ -46,7 +63,7 @@ class D1PreparedStatementMock {
   async run() {
     try {
       const upperSql = (this.sql || '').toUpperCase();
-      if (upperSql.includes('RETURNING') || upperSql.includes('SELECT')) {
+      if (upperSql.includes('RETURNING') || upperSql.trimStart().startsWith('SELECT')) {
         const results = this.stmt.all(...this.bindings);
         return {
           success: true,

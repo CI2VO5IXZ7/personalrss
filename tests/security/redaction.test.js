@@ -88,6 +88,31 @@ describe('Logging Redaction', () => {
     expect(loggedError).toContain('***');
   });
 
+  it('redacts GCS signed-feed credentials from management-facing queue error output', async () => {
+    const keys = [
+      'X-Goog-Signature', 'X-Goog-Credential', 'X-Goog-Security-Token', 'GoogleAccessId'
+    ];
+    const secrets = keys.map((_, index) => `opaqueGcsValue${index}Z`);
+    const query = keys.map((key, index) => `${encodeURIComponent(key)}=${secrets[index]}`).join('&');
+    const badDb = {
+      prepare: () => {
+        throw new Error(`Database failure for https://feeds.example/private.xml?${query}`);
+      }
+    };
+
+    let surfacedError;
+    try {
+      await enqueue(badDb, { kind: 'rss', dedupeKey: 'signed-feed', payload: {} });
+    } catch (error) {
+      surfacedError = error;
+    }
+
+    expect(surfacedError).toBeInstanceOf(Error);
+    const managementOutput = `${surfacedError.message} ${consoleErrorSpy.mock.calls.flat().join(' ')}`;
+    for (const secret of secrets) expect(managementOutput).not.toContain(secret);
+    expect(managementOutput).toContain('***');
+  });
+
   it('should redact credentials and tokens from other queue method error logs', async () => {
     const badDb = {
       prepare: () => {

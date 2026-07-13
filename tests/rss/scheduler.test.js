@@ -5,6 +5,8 @@ import path from 'path';
 import { processSubscription } from '../../src/rss/scheduler.js';
 import { getRssSubscriptions, addRssSubscription } from '../../src/db.js';
 
+const publicResolver = async () => ['93.184.216.34'];
+
 describe('RSS Scheduler / Processor', () => {
   let db;
 
@@ -46,7 +48,7 @@ describe('RSS Scheduler / Processor', () => {
     const subs = await getRssSubscriptions(db);
     const sub = subs[0];
 
-    const res = await processSubscription(db, sub, { DEEPSEEK_API_KEY: 'ds-key' }, { fetchFn: mockFetch });
+    const res = await processSubscription(db, sub, { DEEPSEEK_API_KEY: 'ds-key' }, { resolver: publicResolver, fetchFn: mockFetch });
     expect(res.success).toBe(true);
 
     // Entries should be persisted
@@ -93,7 +95,7 @@ describe('RSS Scheduler / Processor', () => {
       };
     });
 
-    await processSubscription(db, sub, {}, { fetchFn: mockFetch });
+    await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
 
     // 2. Perform second check with 2 new items (unordered chronologically in XML)
     const secondXml = `
@@ -136,7 +138,7 @@ describe('RSS Scheduler / Processor', () => {
     subs = await getRssSubscriptions(db);
     sub = subs[0];
 
-    const res = await processSubscription(db, sub, {}, { fetchFn: mockFetchSecond });
+    const res = await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetchSecond });
     expect(res.success).toBe(true);
     expect(res.count).toBe(2);
 
@@ -202,7 +204,7 @@ describe('RSS Scheduler / Processor', () => {
     const subs = await getRssSubscriptions(db);
     const sub = subs[0];
 
-    const res = await processSubscription(db, sub, { DEEPSEEK_API_KEY: 'ds-key' }, { fetchFn: mockFetch });
+    const res = await processSubscription(db, sub, { DEEPSEEK_API_KEY: 'ds-key' }, { resolver: publicResolver, fetchFn: mockFetch });
     expect(res.success).toBe(true);
 
     // Verify DeepSeek was called with the long extracted body
@@ -215,6 +217,82 @@ describe('RSS Scheduler / Processor', () => {
     const { results: notifications } = await db.prepare('SELECT * FROM notification_queue').all();
     expect(notifications).toHaveLength(1);
     expect(JSON.parse(notifications[0].payload_json).summary).toBe('This is the DeepSeek summary.');
+  });
+
+  it('does not notify when a feed changes the GUID but keeps the same non-empty link', async () => {
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    let [sub] = await getRssSubscriptions(db);
+    const response = xml => ({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/rss+xml' }),
+      text: async () => xml
+    });
+    const item = (guid, title, description) => `<rss><channel><title>Feed</title><item>
+      <guid>${guid}</guid><link>https://test.com/same</link><title>${title}</title>
+      <description>${description}</description></item></channel></rss>`;
+
+    await processSubscription(db, sub, {}, {
+      resolver: publicResolver,
+      fetchFn: vi.fn().mockResolvedValue(response(item('old-guid', 'Old title', 'Old body')))
+    });
+    [sub] = await getRssSubscriptions(db);
+    const secondFetch = vi.fn().mockResolvedValue(response(item('new-guid', 'Changed title', 'Changed body')));
+    const result = await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: secondFetch });
+
+    expect(result.count).toBe(0);
+    expect(secondFetch).toHaveBeenCalledTimes(1);
+    expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(1);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(0);
+  });
+
+  it('does not notify when GUID and link change but normalized article content is unchanged', async () => {
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    let [sub] = await getRssSubscriptions(db);
+    const feed = (guid, link, title, body) => `<rss><channel><title>Feed</title><item>
+      <guid>${guid}</guid><link>${link}</link><title>${title}</title><description>${body}</description>
+      </item></channel></rss>`;
+    const fetchFeedXml = xml => vi.fn().mockResolvedValue({
+      status: 200, headers: new Headers({ 'content-type': 'application/rss+xml' }), text: async () => xml
+    });
+
+    await processSubscription(db, sub, {}, {
+      resolver: publicResolver,
+      fetchFn: fetchFeedXml(feed('old-guid', 'https://test.com/old', 'Same   title', 'Same\nbody'))
+    });
+    [sub] = await getRssSubscriptions(db);
+    const secondFetch = fetchFeedXml(feed('new-guid', 'https://test.com/new', 'Same title', 'Same body'));
+    const result = await processSubscription(db, sub, {}, {
+      resolver: publicResolver,
+      fetchFn: secondFetch
+    });
+
+    expect(result.count).toBe(0);
+    expect(secondFetch).toHaveBeenCalledTimes(1);
+    expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(1);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(0);
+  });
+
+  it('atomically claims concurrent overlapping processing so only one notification is queued', async () => {
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    await db.prepare("UPDATE rss_subscriptions SET last_success_at = '2026-07-13 12:00:00'").run();
+    const [sub] = await getRssSubscriptions(db);
+    const longBody = 'A complete article body. '.repeat(12);
+    const xml = `<rss><channel><title>Feed</title><item><guid>new-guid</guid>
+      <link>https://test.com/new</link><title>New article</title><description>${longBody}</description>
+      </item></channel></rss>`;
+    const fetchFn = vi.fn().mockResolvedValue({
+      status: 200, headers: new Headers({ 'content-type': 'application/rss+xml' }), text: async () => xml
+    });
+
+    const results = await Promise.all([
+      processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn }),
+      processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn })
+    ]);
+
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.reduce((sum, result) => sum + result.count, 0)).toBe(1);
+    expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(1);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(1);
   });
 
   it('should not insert entry and should return failure if notification enqueue fails', async () => {
@@ -247,16 +325,10 @@ describe('RSS Scheduler / Processor', () => {
     const subs = await getRssSubscriptions(db);
     const sub = subs[0];
 
-    // Mock db.prepare to throw an error for enqueue
-    const originalPrepare = db.prepare;
-    db.prepare = function (sql) {
-      if (sql.includes('INSERT OR IGNORE INTO notification_queue')) {
-        throw new Error('Database insertion failed for url https://secret-token@example.com/api?token=secret123');
-      }
-      return originalPrepare.call(db, sql);
-    };
+    db.exec(`CREATE TRIGGER fail_rss_notification BEFORE INSERT ON notification_queue
+      WHEN NEW.kind = 'rss' BEGIN SELECT RAISE(FAIL, 'queue transaction failed'); END;`);
 
-    const res = await processSubscription(db, sub, {}, { fetchFn: mockFetch });
+    const res = await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
     expect(res.success).toBe(false);
     expect(res.error).toBeDefined();
     // Verify error is sanitized (no tokenized URLs / secrets)
@@ -267,8 +339,6 @@ describe('RSS Scheduler / Processor', () => {
     const { results: entries } = await db.prepare("SELECT * FROM rss_entries WHERE entry_key = 'guid-3'").all();
     expect(entries).toHaveLength(0);
 
-    // Restore prepare
-    db.prepare = originalPrepare;
   });
 
   it('should bound new article processing per subscription per invocation (5/5/2)', async () => {
@@ -299,7 +369,7 @@ describe('RSS Scheduler / Processor', () => {
 
     let subs = await getRssSubscriptions(db);
     let sub = subs[0];
-    await processSubscription(db, sub, {}, { fetchFn: mockFetchBaseline });
+    await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetchBaseline });
 
     // Verify baseline was added
     let { results: baselineEntries } = await db.prepare("SELECT * FROM rss_entries").all();
@@ -340,7 +410,7 @@ describe('RSS Scheduler / Processor', () => {
     // Run 1: Should process 5 oldest unseen entries (Item 1 to Item 5)
     subs = await getRssSubscriptions(db);
     sub = subs[0];
-    let res1 = await processSubscription(db, sub, { RSS_PROCESSING_LIMIT: '5' }, { fetchFn: mockFetchNew });
+    let res1 = await processSubscription(db, sub, { RSS_PROCESSING_LIMIT: '5' }, { resolver: publicResolver, fetchFn: mockFetchNew });
     expect(res1.success).toBe(true);
     expect(res1.count).toBe(5);
 
@@ -355,7 +425,7 @@ describe('RSS Scheduler / Processor', () => {
     expect(new Date(updatedSub.next_check_at).getTime()).toBeLessThanOrEqual(Date.now());
 
     // Run 2: Should process next 5 unseen entries (Item 6 to Item 10)
-    res1 = await processSubscription(db, updatedSub, { RSS_PROCESSING_LIMIT: '5' }, { fetchFn: mockFetchNew });
+    res1 = await processSubscription(db, updatedSub, { RSS_PROCESSING_LIMIT: '5' }, { resolver: publicResolver, fetchFn: mockFetchNew });
     expect(res1.success).toBe(true);
     expect(res1.count).toBe(5);
 
@@ -370,7 +440,7 @@ describe('RSS Scheduler / Processor', () => {
     expect(new Date(updatedSub.next_check_at).getTime()).toBeLessThanOrEqual(Date.now());
 
     // Run 3: Should process remaining 2 unseen entries (Item 11 and Item 12)
-    res1 = await processSubscription(db, updatedSub, { RSS_PROCESSING_LIMIT: '5' }, { fetchFn: mockFetchNew });
+    res1 = await processSubscription(db, updatedSub, { RSS_PROCESSING_LIMIT: '5' }, { resolver: publicResolver, fetchFn: mockFetchNew });
     expect(res1.success).toBe(true);
     expect(res1.count).toBe(2);
 
@@ -427,7 +497,7 @@ describe('RSS Scheduler / Processor', () => {
     const subs = await getRssSubscriptions(db);
     const sub = subs[0];
 
-    const res = await processSubscription(db, sub, {}, { fetchFn: mockFetch });
+    const res = await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
     expect(res.success).toBe(true);
 
     // Verify notification queue payloads

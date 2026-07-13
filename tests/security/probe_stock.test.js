@@ -1,7 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import app from '../../src/index.js';
 
 describe('Admin Probe Stock Route', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('should reject requests with missing or invalid token', async () => {
     const req1 = new Request('https://worker.local/admin/probe-stock?code=600519', {
       method: 'GET'
@@ -23,6 +27,9 @@ describe('Admin Probe Stock Route', () => {
   });
 
   it('should allow request with valid authorization token and return quote', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T15:38:00+08:00'));
+
     const req = new Request('https://worker.local/admin/probe-stock?code=600519', {
       method: 'GET',
       headers: {

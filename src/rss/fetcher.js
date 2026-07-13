@@ -12,7 +12,7 @@ export async function fetchFeed(urlStr, options = {}) {
 
   // Use a default user-agent that looks like a standard browser/feed-fetcher
   if (!headers['User-Agent'] && !headers['user-agent']) {
-    headers['User-Agent'] = 'Mozilla/5.0 (compatible; PersonalRSS/2.0; +https://github.com/google/personalrss)';
+    headers['User-Agent'] = 'Mozilla/5.0 (compatible; PersonalRSS/2.0; +https://github.com/CI2VO5IXZ7/personalrss)';
   }
 
   const fetchOptions = {

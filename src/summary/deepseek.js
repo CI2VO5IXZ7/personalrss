@@ -1,18 +1,20 @@
-export function getBeijingDate() {
+import { enqueue } from '../notifications/queue.js';
+
+export function getBeijingDate(date = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit'
   });
-  const parts = formatter.formatToParts(new Date());
+  const parts = formatter.formatToParts(date);
   const year = parts.find(p => p.type === 'year').value;
   const month = parts.find(p => p.type === 'month').value;
   const day = parts.find(p => p.type === 'day').value;
   return `${year}-${month}-${day}`;
 }
 
-export async function checkAndIncrementUsage(db, limit) {
+async function consumeDailyUsage(db, limit) {
   try {
     const dateStr = getBeijingDate();
     const type = 'deepseek_summary';
@@ -27,11 +29,19 @@ export async function checkAndIncrementUsage(db, limit) {
        WHERE usage_date = ? AND usage_type = ? AND count < ?`
     ).bind(dateStr, type, limit).run();
 
-    return result.meta.changes > 0;
+    return {
+      allowed: result.meta.changes > 0,
+      reason: result.meta.changes > 0 ? 'allowed' : 'limit',
+      date: dateStr
+    };
   } catch (e) {
     console.error('[deepseek] checkAndIncrementUsage error:', e.message);
-    return false;
+    return { allowed: false, reason: 'database_error', date: getBeijingDate() };
   }
+}
+
+export async function checkAndIncrementUsage(db, limit) {
+  return (await consumeDailyUsage(db, limit)).allowed;
 }
 
 export function classifyError(errorOrStatus) {
@@ -76,52 +86,63 @@ export async function summarizeContent(apiKey, content, options = {}) {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`DeepSeek API request timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
 
     try {
-      const response = await fetchFn(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            {
-              role: 'system',
-              content: 'You are a helpful assistant summarizing RSS articles in Chinese.'
-            },
-            {
-              role: 'user',
-              content: `Summarize this content in 2-3 sentences: ${truncatedContent}`
-            }
-          ],
-          stream: false
-        }),
-        signal: controller.signal
-      });
+      const request = (async () => {
+        const response = await fetchFn(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              {
+                role: 'system',
+                content: 'Summarize RSS articles in Simplified Chinese. Be strictly factual and use only information present in the article. Do not fabricate, infer unsupported details, or add outside knowledge.'
+              },
+              {
+                role: 'user',
+                content: `Write 2-3 sentences totaling approximately 150-250 Chinese characters. Preserve the article's key facts accurately. Article:\n${truncatedContent}`
+              }
+            ],
+            stream: false
+          }),
+          signal: controller.signal
+        });
 
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
-        const data = await response.json();
-        const summary = data?.choices?.[0]?.message?.content;
-        if (summary) {
-          return summary.trim();
+        if (response.ok) {
+          const data = await response.json();
+          const summary = data?.choices?.[0]?.message?.content;
+          if (summary) {
+            return { summary: summary.trim() };
+          }
+          throw new Error('Invalid response structure from DeepSeek API');
         }
-        throw new Error('Invalid response structure from DeepSeek API');
+
+        return { status: response.status };
+      })();
+
+      const result = await Promise.race([request, timeout]);
+      if (result.summary !== undefined) {
+        return result.summary;
       }
 
-      const status = response.status;
-      const classification = classifyError(status);
+      const classification = classifyError(result.status);
       if (!classification.retryable) {
-        throw new Error(`DeepSeek API request failed with non-retryable status ${status}`);
+        throw new Error(`DeepSeek API request failed with non-retryable status ${result.status}`);
       }
       
-      lastError = new Error(`DeepSeek API returned transient status ${status}`);
+      lastError = new Error(`DeepSeek API returned transient status ${result.status}`);
     } catch (err) {
-      clearTimeout(timeoutId);
       if (err.message && err.message.includes('non-retryable')) {
         throw err;
       }
@@ -130,6 +151,8 @@ export async function summarizeContent(apiKey, content, options = {}) {
         throw err;
       }
       lastError = err;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -139,8 +162,19 @@ export async function summarizeContent(apiKey, content, options = {}) {
 export async function summarizeWithFallback(db, apiKey, content, originalSummary, options = {}) {
   const limit = options.limit !== undefined ? options.limit : 200;
   
-  const allowed = await checkAndIncrementUsage(db, limit);
-  if (!allowed) {
+  const usage = await consumeDailyUsage(db, limit);
+  if (!usage.allowed) {
+    if (usage.reason === 'limit') {
+      try {
+        await enqueue(db, {
+          kind: 'system',
+          dedupeKey: `system:deepseek-soft-limit:${usage.date}`,
+          payload: { message: `DeepSeek daily soft limit reached for Beijing day ${usage.date}; article summaries are using fallback text.` }
+        });
+      } catch (e) {
+        console.error('[deepseek] Failed to enqueue soft-limit alert:', e.message);
+      }
+    }
     return originalSummary;
   }
 

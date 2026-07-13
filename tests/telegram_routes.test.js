@@ -5,6 +5,8 @@ import path from 'path';
 import app from '../src/index.js';
 import { addRssSubscription, getRssSubscriptions } from '../src/db.js';
 
+const publicResolver = async () => ['93.184.216.34'];
+
 describe('Telegram Bot RSS Commands', () => {
   let db;
 
@@ -21,7 +23,7 @@ describe('Telegram Bot RSS Commands', () => {
     const payload = {
       message: {
         text,
-        chat: { id: chatId },
+        chat: { id: chatId, type: 'private' },
         from: { id: 'admin1' }
       }
     };
@@ -36,8 +38,10 @@ describe('Telegram Bot RSS Commands', () => {
     const env = {
       DB: db,
       TELEGRAM_CHAT_ID: '12345',
+      TELEGRAM_ADMIN_USER_ID: 'admin1',
       ADMIN_TOKEN: 'secret-token',
-      TELEGRAM_BOT_TOKEN: 'bot-token'
+      TELEGRAM_BOT_TOKEN: 'bot-token',
+      SAFE_FETCH_RESOLVER: publicResolver
     };
     const ctx = {
       waitUntil: vi.fn(async (promise) => {

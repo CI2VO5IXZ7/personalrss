@@ -1,6 +1,6 @@
 import {
   getTrackerRulesByStatus,
-  atomicTransitionRuleToPending,
+  atomicTriggerAndEnqueueStockNotification,
   addTrackerEvent
 } from '../db.js';
 import { enqueue } from '../notifications/queue.js';
@@ -78,13 +78,24 @@ export async function evaluateRules(db, env, options = {}) {
     }
 
     if (satisfied) {
-      const transitioned = await atomicTransitionRuleToPending(
-        db,
-        rule.id,
-        latestPrice,
-        quote.timestamp,
-        quote.source
-      );
+      const payload = {
+        ruleId: rule.id,
+        armVersion: rule.arm_version,
+        code: symbol,
+        conditionType,
+        conditionValue,
+        price: latestPrice,
+        observedAt: quote.timestamp,
+        source: quote.source
+      };
+      const transitioned = await atomicTriggerAndEnqueueStockNotification(db, {
+        ruleId: rule.id,
+        armVersion: rule.arm_version,
+        lastValue: latestPrice,
+        lastObservedAt: quote.timestamp,
+        lastSource: quote.source,
+        payload
+      });
 
       if (transitioned) {
         await addTrackerEvent(db, {
@@ -96,44 +107,7 @@ export async function evaluateRules(db, env, options = {}) {
           details: { conditionType, conditionValue }
         });
 
-        try {
-          const enqueued = await enqueue(db, {
-            kind: 'stock',
-            dedupeKey: `stock:rule:${rule.id}:${rule.arm_version}`,
-            payload: {
-              ruleId: rule.id,
-              code: symbol,
-              conditionType,
-              conditionValue,
-              price: latestPrice,
-              observedAt: quote.timestamp,
-              source: quote.source
-            }
-          });
-
-          if (!enqueued) {
-            throw new Error('Failed to enqueue stock notification');
-          }
-          triggeredCount++;
-        } catch (err) {
-          console.error(`[engine] notification enqueue failed for rule ${rule.id}, rolling back:`, err.message);
-          await db.prepare(
-            `UPDATE tracker_rules
-             SET status = 'active',
-                 last_value = NULL,
-                 last_observed_at = NULL,
-                 last_source = NULL,
-                 updated_at = datetime('now')
-             WHERE id = ?`
-          ).bind(rule.id).run();
-          
-          await db.prepare(
-            `DELETE FROM tracker_events
-             WHERE rule_id = ? AND event_type = 'trigger_pending'`
-          ).bind(rule.id).run().catch(() => {});
-          
-          throw err;
-        }
+        triggeredCount++;
       }
     }
   }

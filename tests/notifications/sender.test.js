@@ -61,6 +61,8 @@ describe('Notification Sender / Consumer', () => {
   });
 
   it('should fail and retry on Telegram 429 rate limit with correct backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
     await enqueue(db, {
       kind: 'rss',
       dedupeKey: 'key-1',
@@ -94,11 +96,47 @@ describe('Notification Sender / Consumer', () => {
     expect(row.last_error).toContain('Too Many Requests');
     expect(row.attempts).toBe(1);
     
-    // Difference between available_at and now should be approx 25s
-    const availableTime = new Date(row.available_at).getTime();
-    const diff = (availableTime - Date.now()) / 1000;
-    expect(diff).toBeGreaterThan(20);
-    expect(diff).toBeLessThan(30);
+    expect(row.available_at).toBe('2026-07-13T08:00:25.000Z');
+    vi.useRealTimers();
+  });
+
+  it('backs off the first non-429 failure by exactly 60 seconds', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+    await enqueue(db, {
+      kind: 'system', dedupeKey: 'system:first-backoff', payload: { message: 'Alert' }
+    });
+    const mockFetch = vi.fn(async () => ({
+      status: 500, ok: false, json: async () => ({ description: 'upstream failed' })
+    }));
+
+    await processNotificationBatch(db, {
+      TELEGRAM_BOT_TOKEN: 'admin-token', TELEGRAM_CHAT_ID: 'admin-chat'
+    }, { fetchFn: mockFetch, batchLimit: 1 });
+
+    const row = await db.prepare('SELECT attempts, available_at FROM notification_queue').first();
+    expect(row).toEqual({ attempts: 1, available_at: '2026-07-13T08:01:00.000Z' });
+    vi.useRealTimers();
+  });
+
+  it('backs off the second non-429 failure by exactly 120 seconds', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+    await enqueue(db, {
+      kind: 'system', dedupeKey: 'system:second-backoff', payload: { message: 'Alert' }
+    });
+    const mockFetch = vi.fn(async () => ({
+      status: 500, ok: false, json: async () => ({ description: 'upstream failed' })
+    }));
+    const env = { TELEGRAM_BOT_TOKEN: 'admin-token', TELEGRAM_CHAT_ID: 'admin-chat' };
+
+    await processNotificationBatch(db, env, { fetchFn: mockFetch, batchLimit: 1 });
+    vi.setSystemTime(new Date('2026-07-13T08:01:00.000Z'));
+    await processNotificationBatch(db, env, { fetchFn: mockFetch, batchLimit: 1 });
+
+    const row = await db.prepare('SELECT attempts, available_at FROM notification_queue').first();
+    expect(row).toEqual({ attempts: 2, available_at: '2026-07-13T08:03:00.000Z' });
+    vi.useRealTimers();
   });
 
   it('should format stock notifications correctly', async () => {
@@ -138,6 +176,7 @@ describe('Notification Sender / Consumer', () => {
       dedupeKey: 'stock-key-1',
       payload: {
         ruleId,
+        armVersion: 1,
         code: 'sh600519',
         conditionType: 'gte',
         conditionValue: 1700.00,
@@ -186,6 +225,7 @@ describe('Notification Sender / Consumer', () => {
       dedupeKey: 'stock-key-2',
       payload: {
         ruleId,
+        armVersion: 1,
         code: 'sh600519',
         conditionType: 'gte',
         conditionValue: 1700.00,
@@ -233,6 +273,7 @@ describe('Notification Sender / Consumer', () => {
       dedupeKey: 'stock-key-3',
       payload: {
         ruleId,
+        armVersion: 1,
         code: 'sh600519',
         conditionType: 'gte',
         conditionValue: 1700.00,
@@ -288,5 +329,203 @@ describe('Notification Sender / Consumer', () => {
     const { results } = await db.prepare('SELECT status, last_error FROM notification_queue WHERE kind = \'unknown_kind\'').all();
     expect(results[0].status).toBe('pending'); // goes back to pending/failed, not sent!
     expect(results[0].last_error).toContain('Unknown notification kind');
+  });
+
+  it('retries a system notification when admin Bot credentials are missing', async () => {
+    await enqueue(db, {
+      kind: 'system',
+      dedupeKey: 'system:missing-admin-config',
+      payload: { message: 'Operational alert' }
+    });
+    const mockFetch = vi.fn();
+
+    const count = await processNotificationBatch(db, {
+      PUSH_TELEGRAM_BOT_TOKEN: 'push-token',
+      PUSH_TELEGRAM_CHANNEL_ID: 'push-channel'
+    }, { fetchFn: mockFetch, batchLimit: 1 });
+
+    expect(count).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
+    const item = await db.prepare('SELECT status, attempts, last_error FROM notification_queue').first();
+    expect(item.status).toBe('pending');
+    expect(item.attempts).toBe(1);
+    expect(item.last_error).toContain('admin Telegram credentials not configured');
+  });
+
+  it('completes a stale old-arm stock item without calling Telegram', async () => {
+    const { addTrackerRule } = await import('../../src/db.js');
+    await addTrackerRule(db, {
+      providerType: 'stock', targetKey: 'sh600519', targetConfig: {},
+      conditionType: 'gte', conditionValue: 1700, status: 'trigger_pending'
+    });
+    await db.prepare('UPDATE tracker_rules SET arm_version = 2 WHERE id = 1').run();
+    await enqueue(db, {
+      kind: 'stock', dedupeKey: 'stock:rule:1:1',
+      payload: { ruleId: 1, armVersion: 1, code: 'sh600519', conditionType: 'gte', conditionValue: 1700, price: 1750 }
+    });
+    const mockFetch = vi.fn();
+
+    const count = await processNotificationBatch(db, {
+      PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel'
+    }, { fetchFn: mockFetch });
+
+    expect(count).toBe(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect((await db.prepare('SELECT status FROM notification_queue').first()).status).toBe('sent');
+    expect((await db.prepare('SELECT status FROM tracker_rules WHERE id = 1').first()).status).toBe('trigger_pending');
+  });
+
+  it('guards the post-send state update by status and arm version', async () => {
+    const { addTrackerRule } = await import('../../src/db.js');
+    await addTrackerRule(db, {
+      providerType: 'stock', targetKey: 'sh600519', targetConfig: {},
+      conditionType: 'gte', conditionValue: 1700, status: 'trigger_pending'
+    });
+    await enqueue(db, {
+      kind: 'stock', dedupeKey: 'stock:rule:1:1',
+      payload: { ruleId: 1, armVersion: 1, code: 'sh600519', conditionType: 'gte', conditionValue: 1700, price: 1750 }
+    });
+    const mockFetch = vi.fn(async () => {
+      await db.prepare("UPDATE tracker_rules SET status = 'active', arm_version = 2 WHERE id = 1").run();
+      return { status: 200, ok: true, json: async () => ({ ok: true }) };
+    });
+
+    await processNotificationBatch(db, {
+      PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel'
+    }, { fetchFn: mockFetch });
+
+    const rule = await db.prepare('SELECT status, arm_version FROM tracker_rules WHERE id = 1').first();
+    expect(rule).toEqual({ status: 'active', arm_version: 2 });
+    expect((await db.prepare('SELECT * FROM tracker_events').all()).results).toHaveLength(0);
+    expect((await db.prepare('SELECT status FROM notification_queue').first()).status).toBe('sent');
+  });
+
+  it('should not lease or increment attempts of later items when a Telegram 429 occurs on the first item', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+    // Enqueue 3 items
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-1',
+      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+    });
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-2',
+      payload: { feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
+    });
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-3',
+      payload: { feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
+    });
+
+    // Mock fetch to return 429 on the first request
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      return {
+        status: 429,
+        ok: false,
+        json: async () => ({
+          ok: false,
+          error_code: 429,
+          description: 'Flood control active',
+          parameters: { retry_after: 30 }
+        })
+      };
+    });
+
+    const count = await processNotificationBatch(
+      db,
+      { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+      { fetchFn: mockFetch, batchLimit: 3 }
+    );
+
+    // processedCount should be 0 because the first one failed
+    expect(count).toBe(0);
+
+    // Verify all items in database
+    const { results: rows } = await db.prepare('SELECT id, dedupe_key, status, attempts, last_error, available_at FROM notification_queue ORDER BY created_at ASC').all();
+    expect(rows).toHaveLength(3);
+
+    // First item: failed with 429, attempts incremented to 1, status reset to pending (or rescheduled)
+    expect(rows[0].dedupe_key).toBe('key-1');
+    expect(rows[0].status).toBe('pending');
+    expect(rows[0].attempts).toBe(1);
+    expect(rows[0].last_error).toContain('Flood control active');
+    expect(rows[0].available_at).toBe('2026-07-13T08:00:30.000Z');
+
+    // Second and third items: untouched! attempts=0, status=pending, last_error=null
+    expect(rows[1].dedupe_key).toBe('key-2');
+    expect(rows[1].status).toBe('pending');
+    expect(rows[1].attempts).toBe(0);
+    expect(rows[1].last_error).toBeNull();
+
+    expect(rows[2].dedupe_key).toBe('key-3');
+    expect(rows[2].status).toBe('pending');
+    expect(rows[2].attempts).toBe(0);
+    expect(rows[2].last_error).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('should process normal loop up to batchLimit', async () => {
+    // Enqueue 4 items
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-1',
+      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+    });
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-2',
+      payload: { feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
+    });
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-3',
+      payload: { feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
+    });
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'key-4',
+      payload: { feedTitle: 'Feed 4', entryTitle: 'Title 4', summary: 'Summary 4', link: 'https://link.com' }
+    });
+
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 111 } })
+      };
+    });
+
+    // Run with batchLimit = 3
+    const count = await processNotificationBatch(
+      db,
+      { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+      { fetchFn: mockFetch, batchLimit: 3 }
+    );
+
+    // processedCount should be 3
+    expect(count).toBe(3);
+
+    // Verify item statuses: first 3 should be sent, the 4th should be pending with attempts=0
+    const { results: rows } = await db.prepare('SELECT dedupe_key, status, attempts FROM notification_queue ORDER BY created_at ASC').all();
+    expect(rows).toHaveLength(4);
+
+    expect(rows[0].dedupe_key).toBe('key-1');
+    expect(rows[0].status).toBe('sent');
+    expect(rows[0].attempts).toBe(1);
+
+    expect(rows[1].dedupe_key).toBe('key-2');
+    expect(rows[1].status).toBe('sent');
+    expect(rows[1].attempts).toBe(1);
+
+    expect(rows[2].dedupe_key).toBe('key-3');
+    expect(rows[2].status).toBe('sent');
+    expect(rows[2].attempts).toBe(1);
+
+    expect(rows[3].dedupe_key).toBe('key-4');
+    expect(rows[3].status).toBe('pending');
+    expect(rows[3].attempts).toBe(0);
   });
 });

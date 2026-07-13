@@ -656,10 +656,16 @@ export async function getDueRssSubscriptions(db, limit = 10) {
 
 // ─── RSS Entries ──────────────────────────────────────────────────────────────
 
-export async function hasRssEntry(db, subscriptionId, entryKey) {
+export async function hasRssEntry(db, subscriptionId, entryKey, link = '', contentHash = '') {
   try {
-    const row = await db.prepare('SELECT id FROM rss_entries WHERE subscription_id = ? AND entry_key = ?')
-      .bind(subscriptionId, entryKey).first();
+    const row = await db.prepare(
+      `SELECT id FROM rss_entries
+       WHERE subscription_id = ? AND (
+         entry_key = ?
+         OR (? <> '' AND link = ?)
+         OR (? <> '' AND content_hash = ?)
+       )`
+    ).bind(subscriptionId, entryKey, link, link, contentHash, contentHash).first();
     return !!row;
   } catch (e) {
     console.error('[db] hasRssEntry error:', e.message);
@@ -687,6 +693,48 @@ export async function addRssEntry(db, subscriptionId, entry) {
     console.error('[db] addRssEntry error:', e.message);
     return false;
   }
+}
+
+export async function atomicClaimAndEnqueueRssNotification(db, subscriptionId, entry, payload) {
+  const link = entry.link || '';
+  const contentHash = entry.contentHash || '';
+  const payloadJson = typeof payload === 'object' ? JSON.stringify(payload) : payload;
+  const results = await db.batch([
+    db.prepare(
+      `INSERT INTO rss_entries
+         (subscription_id, entry_key, guid, link, title, published_at, content_hash, image_url)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM rss_entries
+         WHERE subscription_id = ? AND (
+           entry_key = ?
+           OR (? <> '' AND link = ?)
+           OR (? <> '' AND content_hash = ?)
+         )
+       )`
+    ).bind(
+      subscriptionId,
+      entry.entryKey,
+      entry.guid || '',
+      link,
+      entry.title || '',
+      entry.publishedAt || '',
+      contentHash,
+      entry.imageUrl || '',
+      subscriptionId,
+      entry.entryKey,
+      link,
+      link,
+      contentHash,
+      contentHash
+    ),
+    db.prepare(
+      `INSERT INTO notification_queue (kind, dedupe_key, payload_json, status, available_at)
+       SELECT 'rss', ?, ?, 'pending', ?
+       WHERE changes() > 0`
+    ).bind(`rss:${subscriptionId}:${entry.entryKey}`, payloadJson, new Date().toISOString())
+  ]);
+  return (results[0]?.meta?.changes || 0) > 0;
 }
 
 // ─── Bot Sessions ────────────────────────────────────────────────────────────
@@ -810,22 +858,33 @@ export async function removeTrackerRule(db, id) {
   }
 }
 
-export async function atomicTransitionRuleToPending(db, id, lastValue, lastObservedAt, lastSource) {
-  try {
-    const result = await db.prepare(
+export async function atomicTriggerAndEnqueueStockNotification(db, {
+  ruleId,
+  armVersion,
+  lastValue,
+  lastObservedAt,
+  lastSource,
+  payload
+}) {
+  const payloadJson = typeof payload === 'object' ? JSON.stringify(payload) : payload;
+  const availableAt = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(
       `UPDATE tracker_rules
        SET status = 'trigger_pending',
            last_value = ?,
            last_observed_at = ?,
            last_source = ?,
            updated_at = datetime('now')
-       WHERE id = ? AND status = 'active'`
-    ).bind(lastValue, lastObservedAt, lastSource, id).run();
-    return result.meta.changes > 0;
-  } catch (e) {
-    console.error('[db] atomicTransitionRuleToPending error:', e.message);
-    return false;
-  }
+       WHERE id = ? AND status = 'active' AND arm_version = ?`
+    ).bind(lastValue, lastObservedAt, lastSource, ruleId, armVersion),
+    db.prepare(
+      `INSERT INTO notification_queue (kind, dedupe_key, payload_json, status, available_at)
+       SELECT 'stock', ?, ?, 'pending', ?
+       WHERE changes() > 0`
+    ).bind(`stock:rule:${ruleId}:${armVersion}`, payloadJson, availableAt)
+  ]);
+  return (results[0]?.meta?.changes || 0) > 0;
 }
 
 export async function addTrackerEvent(db, { ruleId, eventType, value, observedAt, source, details = {} }) {

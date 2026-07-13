@@ -12,11 +12,11 @@ describe('Telegram Command Authentication', () => {
     })
   };
 
-  it('should validate only chat ID if TELEGRAM_ADMIN_USER_ID is not configured', async () => {
+  it('rejects commands when TELEGRAM_ADMIN_USER_ID is not configured', async () => {
     const payload = {
       message: {
         text: '/help',
-        chat: { id: 'allowed_chat_123' },
+        chat: { id: 'allowed_chat_123', type: 'private' },
         from: { id: 'some_user_999' }
       }
     };
@@ -43,15 +43,44 @@ describe('Telegram Command Authentication', () => {
 
     const res = await app.fetch(req, env, ctx);
     expect(res.status).toBe(200);
-    // Since it matches chat ID and no admin user id is configured, it should call handleCommand
-    expect(ctx.waitUntil).toHaveBeenCalledTimes(1);
+    expect(ctx.waitUntil).not.toHaveBeenCalled();
+  });
+
+  it('rejects group commands even when chat and admin IDs match', async () => {
+    const req = new Request('https://worker.local/telegram', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': 'secret-token'
+      },
+      body: JSON.stringify({
+        message: {
+          text: '/help',
+          chat: { id: 'allowed_chat_123', type: 'group' },
+          from: { id: 'authorized_admin_777' }
+        }
+      })
+    });
+    const env = {
+      DB: dbMock,
+      TELEGRAM_CHAT_ID: 'allowed_chat_123',
+      TELEGRAM_ADMIN_USER_ID: 'authorized_admin_777',
+      ADMIN_TOKEN: 'secret-token',
+      TELEGRAM_BOT_TOKEN: 'bot-token'
+    };
+    const ctx = { waitUntil: vi.fn() };
+
+    const res = await app.fetch(req, env, ctx);
+
+    expect(res.status).toBe(200);
+    expect(ctx.waitUntil).not.toHaveBeenCalled();
   });
 
   it('should reject request if chat ID matches but TELEGRAM_ADMIN_USER_ID is configured and does not match', async () => {
     const payload = {
       message: {
         text: '/help',
-        chat: { id: 'allowed_chat_123' },
+        chat: { id: 'allowed_chat_123', type: 'private' },
         from: { id: 'unauthorized_user_888' }
       }
     };
@@ -87,7 +116,7 @@ describe('Telegram Command Authentication', () => {
     const payload = {
       message: {
         text: '/help',
-        chat: { id: 'allowed_chat_123' },
+        chat: { id: 'allowed_chat_123', type: 'private' },
         from: { id: 'authorized_admin_777' }
       }
     };

@@ -54,9 +54,9 @@ describe('Tencent UTF-8 Parsing', () => {
     expect(q.source).toBe('tencent');
   });
 
-  it('should reject invalid, missing or negative values', () => {
+  it('should skip invalid, missing or negative values', () => {
     const invalidResponse = 'v_sh600519="1~贵州茅台~600519~-10.00~1710.00~1715.00~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713153701~0";';
-    expect(() => parseTencentQuote(invalidResponse)).toThrow();
+    expect(parseTencentQuote(invalidResponse)).toEqual({});
   });
 });
 
@@ -82,10 +82,10 @@ describe('Byte-safe Sina Parsing', () => {
     expect(q.source).toBe('sina');
   });
 
-  it('should reject invalid/stale Sina values', () => {
+  it('should skip invalid/suspended Sina values', () => {
     const rawStr = 'var hq_str_sz000001="平安银行,0.00,-11.15,0.00,...,2026-07-13,15:34:59,00";';
     const bytes = new TextEncoder().encode(rawStr);
-    expect(() => parseSinaQuote(bytes)).toThrow();
+    expect(parseSinaQuote(bytes)).toEqual({});
   });
 });
 
@@ -163,7 +163,10 @@ describe('Fallback Provider on Fetch Failure', () => {
       }
     });
 
-    const quotes = await fetchStockQuotes(['sz000001'], { fetchFn: mockFetch });
+    const quotes = await fetchStockQuotes(['sz000001'], {
+      fetchFn: mockFetch,
+      relativeTo: new Date('2026-07-13T15:35:00+08:00')
+    });
     expect(quotes).toHaveProperty('sz000001');
     expect(quotes['sz000001'].latestPrice).toBe(11.25);
     expect(quotes['sz000001'].source).toBe('sina');
@@ -277,10 +280,68 @@ describe('Stock Review Blockers - Regression Tests', () => {
       .rejects.toThrow('All stock quote providers failed');
   });
 
-  it('should verify fields[2] matches the key digits in Tencent parser (symbol mismatch)', () => {
+  it('should skip Tencent rows whose code mismatches the response key', () => {
     // Key is sh600519 but fields[2] is 000001 (mismatch)
     const rawResponse = 'v_sh600519="1~贵州茅台~000001~1720.50~1710.00~1715.00~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713153701~0";';
-    expect(() => parseTencentQuote(rawResponse)).toThrow(/mismatch/i);
+    expect(parseTencentQuote(rawResponse)).toEqual({});
+  });
+
+  it('keeps a valid Tencent quote when another requested row is malformed', async () => {
+    const relativeTo = new Date('2026-07-13T10:00:00+08:00');
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      if (url.includes('sqt.gtimg.cn')) {
+        return {
+          status: 200,
+          text: async () =>
+            'v_sh600519="1~贵州茅台~600519~1700.00~1710.00~1715.00~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713100000~0";\n' +
+            'v_sz000001="1~平安银行~600519~10.05~10.00~10.00~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713100000~0";'
+        };
+      }
+      if (url.includes('sinajs.cn')) {
+        expect(url).toContain('sz000001');
+        expect(url).not.toContain('sh600519');
+        return {
+          status: 200,
+          arrayBuffer: async () => new TextEncoder().encode('var hq_str_sz000001="";').buffer
+        };
+      }
+    });
+
+    const quotes = await fetchStockQuotes(['sh600519', 'sz000001'], { fetchFn: mockFetch, relativeTo });
+
+    expect(quotes['sh600519']).toMatchObject({ latestPrice: 1700, source: 'tencent' });
+    expect(quotes).not.toHaveProperty('sz000001');
+    expect(quotes.missingSymbols).toEqual(['sz000001']);
+  });
+
+  it('keeps a valid Sina quote when another requested row is malformed', async () => {
+    const relativeTo = new Date('2026-07-13T10:00:00+08:00');
+    const validFields = Array(33).fill('0');
+    validFields[0] = '平安银行';
+    validFields[2] = '10.00';
+    validFields[3] = '10.05';
+    validFields[30] = '2026-07-13';
+    validFields[31] = '10:00:00';
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      if (url.includes('sqt.gtimg.cn')) {
+        return { status: 500, text: async () => 'Error' };
+      }
+      if (url.includes('sinajs.cn')) {
+        const rawStr =
+          'var hq_str_sh600519="malformed";\n' +
+          `var hq_str_sz000001="${validFields.join(',')}";`;
+        return {
+          status: 200,
+          arrayBuffer: async () => new TextEncoder().encode(rawStr).buffer
+        };
+      }
+    });
+
+    const quotes = await fetchStockQuotes(['sh600519', 'sz000001'], { fetchFn: mockFetch, relativeTo });
+
+    expect(quotes['sz000001']).toMatchObject({ latestPrice: 10.05, source: 'sina' });
+    expect(quotes).not.toHaveProperty('sh600519');
+    expect(quotes.missingSymbols).toEqual(['sh600519']);
   });
 
   it('should query Sina for missing/invalid/stale Tencent quotes and merge (mixed Tencent+Sina merge)', async () => {

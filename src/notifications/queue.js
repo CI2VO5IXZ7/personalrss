@@ -28,6 +28,11 @@ function generateUUID() {
   });
 }
 
+function safeDeadItemKind(kind) {
+  const value = String(kind || 'unknown');
+  return /^[a-z0-9_-]{1,32}$/i.test(value) ? value : 'unknown';
+}
+
 export async function lease(db, limit, maxAttempts = 3, leaseDurationSeconds = 300, leaseToken = null) {
   try {
     const token = leaseToken || generateUUID();
@@ -49,7 +54,8 @@ export async function lease(db, limit, maxAttempts = 3, leaseDurationSeconds = 3
              (status = 'pending' AND (available_at IS NULL OR available_at <= ?))
              OR
              (status = 'processing' AND (lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
-           )`
+           )
+         RETURNING id, kind`
       ).bind(maxAttempts, nowStr, nowStr),
       db.prepare(
         `UPDATE notification_queue
@@ -70,7 +76,30 @@ export async function lease(db, limit, maxAttempts = 3, leaseDurationSeconds = 3
            LIMIT ?
          )
          RETURNING *`
-      ).bind(nowStr, token, expiresAtStr, nowStr, nowStr, maxAttempts, limit)
+      ).bind(nowStr, token, expiresAtStr, nowStr, nowStr, maxAttempts, limit),
+      db.prepare(
+        `INSERT OR IGNORE INTO notification_queue
+           (kind, dedupe_key, payload_json, status, available_at)
+         SELECT
+           'system',
+           'system:notification-dead:' || id,
+           json_object(
+             'message',
+             'Notification id ' || id || ' kind ' ||
+             CASE
+               WHEN length(kind) BETWEEN 1 AND 32
+                 AND kind NOT GLOB '*[^A-Za-z0-9_-]*' THEN kind
+               ELSE 'unknown'
+             END || ' reached dead status.'
+           ),
+           'pending',
+           ?
+         FROM notification_queue
+         WHERE kind <> 'system'
+           AND status = 'dead'
+           AND attempts >= ?
+           AND last_error = 'max attempts exhausted'`
+      ).bind(nowStr, maxAttempts)
     ]);
 
     return batchResults[1].results || [];
@@ -97,26 +126,40 @@ export async function complete(db, id, leaseToken) {
 
 export async function fail(db, id, leaseToken, errorMsg, backoffSeconds = 60, maxAttempts = 3) {
   try {
+    const cleanErrorMsg = redactText(String(errorMsg || 'Unknown error'));
     const item = await db.prepare(
-      `SELECT attempts FROM notification_queue WHERE id = ? AND status = 'processing' AND lease_token = ?`
+      `SELECT id, kind, attempts FROM notification_queue WHERE id = ? AND status = 'processing' AND lease_token = ?`
     ).bind(id, leaseToken).first();
 
     if (!item) return false;
 
     if (item.attempts >= maxAttempts) {
-      const result = await db.prepare(
-        `UPDATE notification_queue
-         SET status = 'dead', last_error = ?, processing_started_at = NULL, lease_token = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'processing' AND lease_token = ?`
-      ).bind(errorMsg, id, leaseToken).run();
-      return result.meta.changes > 0;
+      const nowStr = new Date().toISOString();
+      const alertPayload = JSON.stringify({
+        message: `Notification id ${Number(item.id)} kind ${safeDeadItemKind(item.kind)} reached dead status.`
+      });
+      const results = await db.batch([
+        db.prepare(
+          `UPDATE notification_queue
+           SET status = 'dead', last_error = ?, processing_started_at = NULL, lease_token = NULL, lease_expires_at = NULL
+           WHERE id = ? AND status = 'processing' AND lease_token = ?`
+        ).bind(cleanErrorMsg, id, leaseToken),
+        db.prepare(
+          `INSERT OR IGNORE INTO notification_queue
+             (kind, dedupe_key, payload_json, status, available_at)
+           SELECT 'system', ?, ?, 'pending', ?
+           FROM notification_queue
+           WHERE id = ? AND kind <> 'system' AND status = 'dead'`
+        ).bind(`system:notification-dead:${Number(item.id)}`, alertPayload, nowStr, id)
+      ]);
+      return results[0].meta.changes > 0;
     } else {
       const availableAt = new Date(Date.now() + backoffSeconds * 1000).toISOString();
       const result = await db.prepare(
         `UPDATE notification_queue
          SET status = 'pending', last_error = ?, available_at = ?, processing_started_at = NULL, lease_token = NULL, lease_expires_at = NULL
          WHERE id = ? AND status = 'processing' AND lease_token = ?`
-      ).bind(errorMsg, availableAt, id, leaseToken).run();
+      ).bind(cleanErrorMsg, availableAt, id, leaseToken).run();
       return result.meta.changes > 0;
     }
   } catch (e) {

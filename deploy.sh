@@ -25,10 +25,10 @@ source <(grep -v '^\s*#' .env | grep -v '^\s*$')
 set +a
 
 # 校验必要变量
-REQUIRED_VARS="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_TOKEN"
+REQUIRED_VARS="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_ADMIN_USER_ID ADMIN_TOKEN DEEPSEEK_API_KEY PUSH_TELEGRAM_BOT_TOKEN PUSH_TELEGRAM_CHANNEL_ID"
 MISSING=""
 for var in $REQUIRED_VARS; do
-  if [ -z "${!var}" ]; then
+  if [ -z "${!var:-}" ]; then
     MISSING="$MISSING  - $var\n"
   fi
 done
@@ -199,6 +199,10 @@ set_secret() {
 set_secret "TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN"
 set_secret "TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID"
 set_secret "ADMIN_TOKEN" "$ADMIN_TOKEN"
+set_secret "DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY"
+set_secret "PUSH_TELEGRAM_BOT_TOKEN" "$PUSH_TELEGRAM_BOT_TOKEN"
+set_secret "PUSH_TELEGRAM_CHANNEL_ID" "$PUSH_TELEGRAM_CHANNEL_ID"
+set_secret "TELEGRAM_ADMIN_USER_ID" "$TELEGRAM_ADMIN_USER_ID"
 
 # 如果 BASE_URL 更新了，重新部署一次
 if [ -n "$WORKER_URL" ]; then
@@ -212,7 +216,7 @@ fi
 echo "[6/6] 设置 Telegram Webhook..."
 if [ -n "$WORKER_URL" ]; then
   WEBHOOK_RESP=$(curl -sf -X POST "$WORKER_URL/setup-webhook" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" 2>&1) || true
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>&1) || true
   if echo "$WEBHOOK_RESP" | grep -q '"ok":true'; then
     echo "  ✅ Telegram Webhook 设置成功"
   else

@@ -157,13 +157,13 @@ export function parseTencentQuote(text) {
     const tsStr = fields[30]; // YYYYMMDDHHMMSS
     
     if (!code || isNaN(latestPrice) || latestPrice <= 0 || isNaN(yesterdayClose) || yesterdayClose <= 0 || !tsStr || tsStr.length < 14) {
-      throw new Error(`Invalid Tencent quote data for ${key}`);
+      continue;
     }
 
     // Verify fields[2] matches the six digits from the response key
     const keyDigits = key.slice(-6);
     if (code !== keyDigits) {
-      throw new Error(`Symbol mismatch for ${key}: expected code ${keyDigits}, got ${code}`);
+      continue;
     }
     
     const year = tsStr.slice(0, 4);
@@ -200,7 +200,7 @@ export function parseSinaQuote(bytes) {
     const content = match[2];
     const fields = content.split(',');
     if (fields.length < 32) {
-      throw new Error(`Invalid Sina quote data length for ${key}`);
+      continue;
     }
     
     const latestPrice = parseFloat(fields[3]);
@@ -209,7 +209,7 @@ export function parseSinaQuote(bytes) {
     const time = fields[31];
     
     if (isNaN(latestPrice) || latestPrice <= 0 || isNaN(yesterdayClose) || yesterdayClose <= 0 || !date || !time) {
-      throw new Error(`Invalid Sina quote data for ${key}`);
+      continue;
     }
     
     const timestamp = `${date}T${time}+08:00`;

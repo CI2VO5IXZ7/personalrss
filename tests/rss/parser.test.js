@@ -106,4 +106,19 @@ describe('RSS/Atom Parser', () => {
     expect(entry.link).toBe('');
     expect(entry.entryKey).toMatch(/^[a-f0-9]{64}$/); // SHA-256 hex
   });
+
+  it('should hash normalized title and content stably while leaving meaningless content hashes empty', async () => {
+    const meaningfulXml = `
+      <rss version="2.0"><channel><title>Feed</title>
+        <item><guid>one</guid><title> Same   article </title><description>Body\n text</description></item>
+        <item><guid>two</guid><title>Same article</title><description> Body text </description></item>
+        <item><guid>blank</guid></item>
+      </channel></rss>`;
+
+    const feed = await parseFeed(meaningfulXml, 'sub-1');
+
+    expect(feed.entries[0].contentHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(feed.entries[1].contentHash).toBe(feed.entries[0].contentHash);
+    expect(feed.entries[2].contentHash).toBe('');
+  });
 });

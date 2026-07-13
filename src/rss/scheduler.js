@@ -2,18 +2,19 @@ import { fetchFeed } from './fetcher.js';
 import { parseFeed } from './parser.js';
 import { extractArticleText } from './sanitizer.js';
 import { summarizeWithFallback } from '../summary/deepseek.js';
-import { enqueue } from '../notifications/queue.js';
 import { safeFetch, isSafeUrl, redactUrl, redactText } from '../security/url.js';
 import {
   updateRssSubscriptionCheck,
   addRssEntry,
-  hasRssEntry
+  hasRssEntry,
+  atomicClaimAndEnqueueRssNotification
 } from '../db.js';
 
 export async function processSubscription(db, sub, env, options = {}) {
   const deepseekApiKey = env.DEEPSEEK_API_KEY;
   const deepseekLimit = parseInt(env.DEEPSEEK_DAILY_LIMIT || '200', 10);
   const fetchFn = options.fetchFn || fetch;
+  const resolver = options.resolver;
 
   const now = new Date();
   const nextCheckAt = new Date(now.getTime() + sub.interval_minutes * 60 * 1000).toISOString();
@@ -23,7 +24,8 @@ export async function processSubscription(db, sub, env, options = {}) {
     fetchResult = await fetchFeed(sub.feed_url, {
       etag: sub.etag,
       lastModified: sub.last_modified,
-      fetchFn
+      fetchFn,
+      ...(resolver ? { resolver } : {})
     });
   } catch (err) {
     const consecutiveFailures = (sub.consecutive_failures || 0) + 1;
@@ -89,7 +91,13 @@ export async function processSubscription(db, sub, env, options = {}) {
 
   const newEntries = [];
   for (const entry of parsed.entries) {
-    const exists = await hasRssEntry(db, sub.id, entry.entryKey);
+    const exists = await hasRssEntry(
+      db,
+      sub.id,
+      entry.entryKey,
+      entry.link || '',
+      entry.contentHash || ''
+    );
     if (!exists) {
       newEntries.push(entry);
     }
@@ -105,9 +113,10 @@ export async function processSubscription(db, sub, env, options = {}) {
   const hasBacklog = !isFirstFetch && newEntries.length > limit;
   const entriesToProcess = isFirstFetch ? newEntries : newEntries.slice(0, limit);
 
+  let processedCount = 0;
   if (isFirstFetch) {
     for (const entry of entriesToProcess) {
-      await addRssEntry(db, sub.id, entry);
+      if (await addRssEntry(db, sub.id, entry)) processedCount++;
     }
   } else {
     for (const entry of entriesToProcess) {
@@ -118,6 +127,7 @@ export async function processSubscription(db, sub, env, options = {}) {
         try {
           const pageRes = await safeFetch(entry.link, {
             fetchFn,
+            ...(resolver ? { resolver } : {}),
             timeoutMs: 5000,
             allowedContentTypes: ['text/html']
           });
@@ -144,7 +154,6 @@ export async function processSubscription(db, sub, env, options = {}) {
         );
       }
 
-      const dedupeKey = `rss:${sub.id}:${entry.entryKey}`;
       const payload = {
         feedTitle: updatedTitle,
         entryTitle: entry.title,
@@ -154,12 +163,10 @@ export async function processSubscription(db, sub, env, options = {}) {
       };
 
       try {
-        await enqueue(db, {
-          kind: 'rss',
-          dedupeKey,
-          payload
-        });
+        const claimed = await atomicClaimAndEnqueueRssNotification(db, sub.id, entry, payload);
+        if (claimed) processedCount++;
       } catch (err) {
+        const cleanError = redactText(err.message);
         const consecutiveFailures = (sub.consecutive_failures || 0) + 1;
         await updateRssSubscriptionCheck(db, sub.id, {
           status: consecutiveFailures >= 6 ? 'error' : 'active',
@@ -168,13 +175,11 @@ export async function processSubscription(db, sub, env, options = {}) {
           lastCheckedAt: now.toISOString(),
           lastSuccessAt: sub.last_success_at,
           consecutiveFailures,
-          lastError: err.message,
+          lastError: cleanError,
           nextCheckAt: now.toISOString()
         });
-        return { success: false, error: err.message };
+        return { success: false, error: cleanError };
       }
-
-      await addRssEntry(db, sub.id, entry);
     }
   }
 
@@ -198,7 +203,7 @@ export async function processSubscription(db, sub, env, options = {}) {
       .bind(updatedTitle, updatedSiteUrl, sub.id).run();
   }
 
-  return { success: true, count: entriesToProcess.length };
+  return { success: true, count: processedCount };
 }
 
 export async function processDueSubscriptions(db, env, options = {}) {

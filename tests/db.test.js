@@ -15,12 +15,14 @@ import {
   getDueRssSubscriptions,
   addRssEntry,
   hasRssEntry,
+  atomicClaimAndEnqueueRssNotification,
   getBotSession,
   setBotSession,
   clearBotSession,
   addTrackerRule,
   getTrackerRule,
-  updateTrackerRuleStatus
+  updateTrackerRuleStatus,
+  atomicTriggerAndEnqueueStockNotification
 } from '../src/db.js';
 
 describe('RSS D1 Repository & Bot Sessions', () => {
@@ -153,6 +155,27 @@ describe('RSS D1 Repository & Bot Sessions', () => {
     // Attempting to add duplicate should fail/ignore
     const addedDup = await addRssEntry(db, subId, entry);
     expect(addedDup).toBe(false);
+
+    expect(await hasRssEntry(db, subId, 'changed-guid', entry.link, 'different-hash')).toBe(true);
+    expect(await hasRssEntry(db, subId, 'changed-guid', 'https://feed.com/changed', entry.contentHash)).toBe(true);
+  });
+
+  it('atomically rolls back an RSS entry when notification queue insertion fails', async () => {
+    await addRssSubscription(db, 'https://feed.com', 'https://feed.com', '', 'Feed', 10);
+    const [sub] = await getRssSubscriptions(db);
+    const entry = {
+      entryKey: 'new-guid', guid: 'new-guid', link: 'https://feed.com/new',
+      title: 'New', publishedAt: '2026-07-13T12:00:00Z', contentHash: 'new-hash', imageUrl: ''
+    };
+    db.exec(`CREATE TRIGGER fail_rss_notification BEFORE INSERT ON notification_queue
+      WHEN NEW.kind = 'rss' BEGIN SELECT RAISE(FAIL, 'queue failed'); END;`);
+
+    await expect(atomicClaimAndEnqueueRssNotification(db, sub.id, entry, {
+      feedTitle: 'Feed', entryTitle: 'New'
+    })).rejects.toThrow('queue failed');
+
+    expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(0);
   });
 
   it('should enforce feed_url uniqueness and ignore duplicate add attempts', async () => {
@@ -212,6 +235,25 @@ describe('Tracker Rules Status Management', () => {
       'utf8'
     );
     db.exec(migrationSql);
+  });
+
+  it('rolls back the rule transition when the stock notification insert fails', async () => {
+    await addTrackerRule(db, {
+      providerType: 'stock', targetKey: 'sh600519', targetConfig: {},
+      conditionType: 'gte', conditionValue: 1700
+    });
+    await db.prepare(
+      `INSERT INTO notification_queue (kind, dedupe_key, payload_json)
+       VALUES ('stock', 'stock:rule:1:1', '{}')`
+    ).run();
+
+    await expect(atomicTriggerAndEnqueueStockNotification(db, {
+      ruleId: 1, armVersion: 1, lastValue: 1750,
+      lastObservedAt: '2026-07-13T10:00:00+08:00', lastSource: 'tencent',
+      payload: { ruleId: 1, armVersion: 1 }
+    })).rejects.toThrow();
+
+    expect((await getTrackerRule(db, 1)).status).toBe('active');
   });
 
   it('should only resume paused or triggered rules and increment arm_version exactly once', async () => {

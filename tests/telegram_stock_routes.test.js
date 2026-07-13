@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { D1Mock } from './helpers/d1_mock.js';
 import fs from 'fs';
 import path from 'path';
@@ -9,6 +9,9 @@ describe('Telegram Bot Stock Commands', () => {
   let db;
 
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-13T07:40:00.000Z'));
+
     db = new D1Mock();
     const migrationSql = fs.readFileSync(
       path.resolve(__dirname, '../migrations/0005_personal_info_hub.sql'),
@@ -17,11 +20,15 @@ describe('Telegram Bot Stock Commands', () => {
     db.exec(migrationSql);
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   const sendWebhookRequest = async (text, chatId = '12345') => {
     const payload = {
       message: {
         text,
-        chat: { id: chatId },
+        chat: { id: chatId, type: 'private' },
         from: { id: 'admin1' }
       }
     };
@@ -36,6 +43,7 @@ describe('Telegram Bot Stock Commands', () => {
     const env = {
       DB: db,
       TELEGRAM_CHAT_ID: '12345',
+      TELEGRAM_ADMIN_USER_ID: 'admin1',
       ADMIN_TOKEN: 'secret-token',
       TELEGRAM_BOT_TOKEN: 'bot-token'
     };

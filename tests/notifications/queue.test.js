@@ -114,6 +114,67 @@ describe('D1 Notification Queue', () => {
     expect(row.last_error).toBe('Final blow');
   });
 
+  it('enqueues one payload-free system alert when fail marks a non-system item dead', async () => {
+    await enqueue(db, {
+      kind: 'rss',
+      dedupeKey: 'rss-with-secret',
+      payload: { title: 'do not leak', token: 'super-secret-token' }
+    });
+    const [item] = await lease(db, 1, 1);
+
+    expect(await fail(
+      db,
+      item.id,
+      item.lease_token,
+      'final failure at https://service.test/send?token=dead-secret',
+      0,
+      1
+    )).toBe(true);
+
+    const alert = await db.prepare("SELECT * FROM notification_queue WHERE kind = 'system'").first();
+    expect(alert.dedupe_key).toBe(`system:notification-dead:${item.id}`);
+    const message = JSON.parse(alert.payload_json).message;
+    expect(message).toContain(`id ${item.id}`);
+    expect(message).toContain('kind rss');
+    expect(message).not.toContain('do not leak');
+    expect(message).not.toContain('super-secret-token');
+    expect(message).not.toContain('final failure');
+    const deadItem = await db.prepare('SELECT last_error FROM notification_queue WHERE id = ?').bind(item.id).first();
+    expect(deadItem.last_error).not.toContain('dead-secret');
+  });
+
+  it('does not recursively alert when a system notification dies', async () => {
+    await enqueue(db, {
+      kind: 'system',
+      dedupeKey: 'system:original-alert',
+      payload: { message: 'Original alert' }
+    });
+    const [item] = await lease(db, 1, 1);
+
+    expect(await fail(db, item.id, item.lease_token, 'admin delivery failed', 0, 1)).toBe(true);
+
+    const { results } = await db.prepare("SELECT * FROM notification_queue WHERE kind = 'system'").all();
+    expect(results).toHaveLength(1);
+    expect(results[0].dedupe_key).toBe('system:original-alert');
+    expect(results[0].status).toBe('dead');
+  });
+
+  it('rolls back fail dead transition when its system alert insert fails', async () => {
+    await enqueue(db, { kind: 'rss', dedupeKey: 'atomic-fail', payload: { secret: 'hidden' } });
+    const [item] = await lease(db, 1, 1);
+    db.exec(`CREATE TRIGGER reject_dead_alert BEFORE INSERT ON notification_queue
+      WHEN NEW.dedupe_key = 'system:notification-dead:${item.id}'
+      BEGIN SELECT RAISE(FAIL, 'alert insert failed'); END;`);
+
+    expect(await fail(db, item.id, item.lease_token, 'private final error', 0, 1)).toBe(false);
+
+    const row = await db.prepare('SELECT status, lease_token FROM notification_queue WHERE id = ?')
+      .bind(item.id).first();
+    expect(row).toEqual({ status: 'processing', lease_token: item.lease_token });
+    expect((await db.prepare("SELECT * FROM notification_queue WHERE kind = 'system'").all()).results)
+      .toHaveLength(0);
+  });
+
   describe('Lease Recovery and Validation Regressions', () => {
     it('should support lease expiry and recovery for crashed/stale workers', async () => {
       vi.useFakeTimers();
@@ -207,6 +268,25 @@ describe('D1 Notification Queue', () => {
   });
 
   describe('Queue Exhaustion', () => {
+    it('rolls back the exhausted sweep when its system alert insert fails', async () => {
+      await enqueue(db, { kind: 'rss', dedupeKey: 'atomic-sweep', payload: { secret: 'hidden' } });
+      await db.prepare(
+        "UPDATE notification_queue SET attempts = 3, status = 'pending', available_at = ? WHERE dedupe_key = 'atomic-sweep'"
+      ).bind(new Date().toISOString()).run();
+      const item = await db.prepare("SELECT id FROM notification_queue WHERE dedupe_key = 'atomic-sweep'").first();
+      db.exec(`CREATE TRIGGER reject_sweep_alert BEFORE INSERT ON notification_queue
+        WHEN NEW.dedupe_key = 'system:notification-dead:${item.id}'
+        BEGIN SELECT RAISE(FAIL, 'alert insert failed'); END;`);
+
+      expect(await lease(db, 1, 3, 10)).toEqual([]);
+
+      const row = await db.prepare('SELECT status, attempts FROM notification_queue WHERE id = ?')
+        .bind(item.id).first();
+      expect(row).toEqual({ status: 'pending', attempts: 3 });
+      expect((await db.prepare("SELECT * FROM notification_queue WHERE kind = 'system'").all()).results)
+        .toHaveLength(0);
+    });
+
     it('should move a crashed final leased attempt to dead after expiry', async () => {
       vi.useFakeTimers();
       const startTime = new Date(2026, 6, 13, 12, 0, 0);
@@ -245,6 +325,12 @@ describe('D1 Notification Queue', () => {
       expect(row.lease_token).toBeNull();
       expect(row.lease_expires_at).toBeNull();
 
+      const deadAlert = await db.prepare("SELECT * FROM notification_queue WHERE kind = 'system'").first();
+      expect(deadAlert.dedupe_key).toBe(`system:notification-dead:${row.id}`);
+      expect(JSON.parse(deadAlert.payload_json)).toEqual({
+        message: `Notification id ${row.id} kind rss reached dead status.`
+      });
+
       // Verify lease-token stale-worker safety: crashed worker trying to complete/fail should fail
       const compCrashed = await complete(db, row.id, crashedToken);
       expect(compCrashed).toBe(false);
@@ -273,6 +359,20 @@ describe('D1 Notification Queue', () => {
       expect(row.status).toBe('dead');
       expect(row.last_error).toBe('max attempts exhausted');
       expect(row.lease_token).toBeNull();
+    });
+
+    it('does not recursively alert an exhausted system row during the lease sweep', async () => {
+      await enqueue(db, {
+        kind: 'system', dedupeKey: 'system:exhausted', payload: { message: 'Original alert' }
+      });
+      await db.prepare(
+        "UPDATE notification_queue SET attempts = 3, status = 'pending', available_at = ? WHERE dedupe_key = 'system:exhausted'"
+      ).bind(new Date().toISOString()).run();
+
+      expect(await lease(db, 1, 3, 10)).toEqual([]);
+
+      const { results } = await db.prepare("SELECT dedupe_key, status FROM notification_queue WHERE kind = 'system'").all();
+      expect(results).toEqual([{ dedupe_key: 'system:exhausted', status: 'dead' }]);
     });
 
     it('should leave non-expired processing row untouched', async () => {

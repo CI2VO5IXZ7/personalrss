@@ -165,6 +165,84 @@ function isPrivateOrUnsafeIPv6(blocks) {
   return false;
 }
 
+function parseIpAddress(host) {
+  const normalized = host.toLowerCase().replace(/\.$/, '');
+  const ipv4 = parseIPv4(normalized);
+  if (ipv4) return { family: 4, parts: ipv4 };
+
+  const unwrapped = normalized.startsWith('[') && normalized.endsWith(']')
+    ? normalized.slice(1, -1)
+    : normalized;
+  if (!unwrapped.includes(':')) return null;
+  const ipv6 = parseIPv6(unwrapped);
+  return ipv6 ? { family: 6, parts: ipv6 } : null;
+}
+
+function isUnsafeIpAddress(address) {
+  const parsed = parseIpAddress(address);
+  if (!parsed) return null;
+  if (parsed.family === 4) return isPrivateOrUnsafeIPv4(parsed.parts);
+
+  if (isPrivateOrUnsafeIPv6(parsed.parts)) return true;
+  const isIPv4Mapped = parsed.parts.slice(0, 5).every(block => block === 0)
+    && parsed.parts[5] === 0xffff;
+  const isIPv4Compatible = parsed.parts.slice(0, 6).every(block => block === 0);
+  if (isIPv4Mapped || isIPv4Compatible) {
+    return isPrivateOrUnsafeIPv4([
+      (parsed.parts[6] >> 8) & 0xff,
+      parsed.parts[6] & 0xff,
+      (parsed.parts[7] >> 8) & 0xff,
+      parsed.parts[7] & 0xff
+    ]);
+  }
+  return false;
+}
+
+function isUnsafeHostname(host) {
+  const normalized = host.toLowerCase().replace(/\.$/, '');
+  return normalized === 'localhost'
+    || normalized.endsWith('.localhost')
+    || normalized === 'local'
+    || normalized.endsWith('.local')
+    || normalized === 'internal'
+    || normalized.endsWith('.internal')
+    || normalized === 'localdomain'
+    || normalized.endsWith('.localdomain')
+    || normalized === 'metadata'
+    || normalized === 'instance-data';
+}
+
+const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
+const DOH_TIMEOUT_MS = 3000;
+
+async function resolveHostnameWithDoH(hostname) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DOH_TIMEOUT_MS);
+  const query = async type => {
+    const url = `${DOH_ENDPOINT}?name=${encodeURIComponent(hostname)}&type=${type}`;
+    const response = await fetch(url, {
+      headers: { Accept: 'application/dns-json' },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`DoH request failed with status ${response.status}`);
+    const body = await response.json();
+    if (body.Status !== 0) throw new Error(`DoH lookup failed with status ${body.Status}`);
+    return Array.isArray(body.Answer)
+      ? body.Answer.filter(answer => answer.type === type).map(answer => answer.data)
+      : [];
+  };
+
+  try {
+    const [ipv4, ipv6] = await Promise.all([query(1), query(28)]);
+    return [...ipv4, ...ipv6];
+  } catch (err) {
+    controller.abort();
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export function isSafeUrl(urlStr) {
   try {
     const url = new URL(urlStr);
@@ -173,8 +251,8 @@ export function isSafeUrl(urlStr) {
     }
     const host = url.hostname.toLowerCase().replace(/\.$/, '');
     
-    // Loopback hostnames
-    if (host === 'localhost' || host.endsWith('.localhost')) {
+    // Loopback, private-use, and cloud metadata hostnames
+    if (isUnsafeHostname(host)) {
       return false;
     }
 
@@ -214,6 +292,33 @@ export function isSafeUrl(urlStr) {
   }
 }
 
+const SENSITIVE_KEYS = new Set([
+  'token',
+  'key',
+  'auth',
+  'pass',
+  'password',
+  'secret',
+  'api_key',
+  'apikey',
+  'signature',
+  'sig',
+  'code',
+  'access_token',
+  'auth_token',
+  'credential',
+  'expires',
+  'x-amz-signature',
+  'x-amz-credential',
+  'x-amz-security-token',
+  'x-goog-signature',
+  'x-goog-credential',
+  'x-goog-security-token',
+  'googleaccessid',
+  'policy',
+  'key-pair-id'
+]);
+
 export function redactUrl(urlStr) {
   try {
     const url = new URL(urlStr);
@@ -226,9 +331,8 @@ export function redactUrl(urlStr) {
       }
     }
     // Redact query params
-    const sensitiveKeys = ['token', 'key', 'auth', 'pass', 'password', 'secret', 'api_key', 'apikey'];
     for (const key of [...url.searchParams.keys()]) {
-      if (sensitiveKeys.includes(key.toLowerCase())) {
+      if (SENSITIVE_KEYS.has(key.toLowerCase())) {
         url.searchParams.set(key, '***');
       }
     }
@@ -238,9 +342,73 @@ export function redactUrl(urlStr) {
   }
 }
 
+function cancelResponseBody(response) {
+  if (!response?.body || typeof response.body.cancel !== 'function') return;
+  try {
+    Promise.resolve(response.body.cancel()).catch(() => {});
+  } catch {
+    // The body may already be locked, aborted, or cancelled.
+  }
+}
+
+function cancelReader(reader) {
+  if (!reader || typeof reader.cancel !== 'function') return;
+  try {
+    Promise.resolve(reader.cancel()).catch(() => {});
+  } catch {
+    // The reader may already be closed or cancelled.
+  }
+}
+
+async function consumeBoundedText(response, maxBytes, race, controller) {
+  const sizeError = () => new Error(`Response text size exceeds limit of ${maxBytes} bytes`);
+
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const textChunks = [];
+    let totalBytes = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await race(reader.read());
+        if (done) break;
+
+        const bytes = value instanceof Uint8Array
+          ? value
+          : ArrayBuffer.isView(value)
+            ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+            : new Uint8Array(value);
+        if (totalBytes + bytes.byteLength > maxBytes) {
+          controller.abort();
+          cancelReader(reader);
+          throw sizeError();
+        }
+        totalBytes += bytes.byteLength;
+        textChunks.push(decoder.decode(bytes, { stream: true }));
+      }
+    } catch (err) {
+      cancelReader(reader);
+      throw err;
+    }
+
+    textChunks.push(decoder.decode());
+    return textChunks.join('');
+  }
+
+  if (typeof response.text !== 'function') return '';
+  const text = await race(Promise.resolve().then(() => response.text()));
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    controller.abort();
+    throw sizeError();
+  }
+  return text;
+}
+
 export async function safeFetch(urlStr, options = {}) {
   const {
     fetchFn = fetch,
+    resolver = resolveHostnameWithDoH,
     maxRedirects = 5,
     timeoutMs = 10000,
     maxBytes = 2 * 1024 * 1024,
@@ -250,6 +418,7 @@ export async function safeFetch(urlStr, options = {}) {
 
   let currentUrl = urlStr;
   let redirectCount = 0;
+  const resolutionCache = new Map();
 
   try {
     while (true) {
@@ -257,69 +426,102 @@ export async function safeFetch(urlStr, options = {}) {
         throw new Error(`Unsafe redirect URL: ${redactUrl(currentUrl)}`);
       }
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const parsedUrl = new URL(currentUrl);
+      const hostname = parsedUrl.hostname.toLowerCase().replace(/\.$/, '');
+      if (!parseIpAddress(hostname)) {
+        let resolution = resolutionCache.get(hostname);
+        if (!resolution) {
+          resolution = Promise.resolve().then(() => resolver(hostname));
+          resolutionCache.set(hostname, resolution);
+        }
 
-      let response;
-      try {
-        response = await fetchFn(currentUrl, {
-          ...cleanOptions,
-          redirect: 'manual',
-          signal: controller.signal
-        });
-      } catch (err) {
-        throw new Error(redactText(err.message || String(err)));
-      } finally {
-        clearTimeout(timeoutId);
+        let addresses;
+        try {
+          addresses = await resolution;
+        } catch (err) {
+          throw new Error(
+            `Hostname resolution failed for ${redactUrl(currentUrl)}: ${redactText(err?.message || String(err))}`
+          );
+        }
+
+        if (!Array.isArray(addresses) || addresses.length === 0) {
+          throw new Error(`Hostname resolution failed for ${redactUrl(currentUrl)}: no usable address`);
+        }
+        const safety = addresses.map(address => isUnsafeIpAddress(String(address)));
+        if (safety.some(result => result === null)) {
+          throw new Error(`Hostname resolution failed for ${redactUrl(currentUrl)}: invalid address answer`);
+        }
+        if (safety.some(Boolean)) {
+          throw new Error(`Unsafe hostname resolution for ${redactUrl(currentUrl)}`);
+        }
       }
 
-      if (response.status >= 300 && response.status < 400 && response.status !== 304) {
-        const location = response.headers.get('location');
-        if (!location) {
-          throw new Error(`Redirect status ${response.status} with no Location header`);
-        }
-        redirectCount++;
-        if (redirectCount > maxRedirects) {
-          throw new Error('Too many redirects');
-        }
+      const controller = new AbortController();
+      let response;
+      let timeoutId;
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`Request timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+      });
+      const race = operation => Promise.race([Promise.resolve(operation), timeoutPromise]);
+
+      try {
         try {
-          currentUrl = new URL(location, currentUrl).toString();
+          response = await race(Promise.resolve().then(() => fetchFn(currentUrl, {
+            ...cleanOptions,
+            redirect: 'manual',
+            signal: controller.signal
+          })));
         } catch (err) {
           throw new Error(redactText(err.message || String(err)));
         }
-        continue;
-      }
 
-      if (allowedContentTypes) {
-        const contentType = response.headers.get('content-type') || '';
-        const isAllowed = allowedContentTypes.some(t => contentType.toLowerCase().includes(t.toLowerCase()));
-        if (!isAllowed) {
-          throw new Error(`Content type ${contentType} not allowed`);
-        }
-      }
-
-      const contentLength = response.headers.get('content-length');
-      if (contentLength && parseInt(contentLength, 10) > maxBytes) {
-        throw new Error(`Response size exceeds limit of ${maxBytes} bytes`);
-      }
-
-      const originalText = response.text;
-      if (originalText) {
-        response.text = async () => {
+        if (response.status >= 300 && response.status < 400 && response.status !== 304) {
+          const location = response.headers.get('location');
+          if (!location) {
+            throw new Error(`Redirect status ${response.status} with no Location header`);
+          }
+          redirectCount++;
+          if (redirectCount > maxRedirects) {
+            throw new Error('Too many redirects');
+          }
           try {
-            const textVal = await originalText.call(response);
-            const byteLength = new TextEncoder().encode(textVal).length;
-            if (byteLength > maxBytes) {
-              throw new Error(`Response text size exceeds limit of ${maxBytes} bytes`);
-            }
-            return textVal;
+            currentUrl = new URL(location, currentUrl).toString();
           } catch (err) {
             throw new Error(redactText(err.message || String(err)));
           }
-        };
-      }
+          controller.abort();
+          await cancelResponseBody(response);
+          continue;
+        }
 
-      return response;
+        if (allowedContentTypes) {
+          const contentType = response.headers.get('content-type') || '';
+          const isAllowed = allowedContentTypes.some(t => contentType.toLowerCase().includes(t.toLowerCase()));
+          if (!isAllowed) {
+            throw new Error(`Content type ${contentType} not allowed`);
+          }
+        }
+
+        const contentLength = response.headers.get('content-length');
+        if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+          controller.abort();
+          await cancelResponseBody(response);
+          throw new Error(`Response size exceeds limit of ${maxBytes} bytes`);
+        }
+
+        const boundedText = await consumeBoundedText(response, maxBytes, race, controller);
+        response.text = async () => boundedText;
+        return response;
+      } catch (err) {
+        controller.abort();
+        await cancelResponseBody(response);
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+      }
     }
   } catch (err) {
     const msg = redactText(err.message || String(err));
@@ -344,10 +546,13 @@ export function redactText(str) {
     }
   });
 
-  const sensitiveKeys = ['token', 'key', 'auth', 'pass', 'password', 'secret', 'api_key', 'apikey'];
-  for (const key of sensitiveKeys) {
-    const regex = new RegExp(`(${key})\\s*([=:]+)\\s*("[^"]+"|[a-zA-Z0-9_-]+)`, 'gi');
-    sanitized = sanitized.replace(regex, '$1$2***');
+  for (const key of SENSITIVE_KEYS) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(
+      `(^|[^a-zA-Z0-9_-])(${escapedKey})\\s*([=:]+)\\s*("[^"]*"|'[^']*'|[^\\s,;]+)`,
+      'gi'
+    );
+    sanitized = sanitized.replace(regex, '$1$2$3***');
   }
 
   return sanitized;

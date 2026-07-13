@@ -77,6 +77,7 @@ describe('Stock Evaluation Engine', () => {
     const payload = JSON.parse(results[0].payload_json);
     expect(payload.price).toBe(1700.00);
     expect(payload.code).toBe('sh600519');
+    expect(payload.armVersion).toBe(1);
   });
 
   it('should rollback to active state if notification enqueue fails', async () => {
@@ -95,12 +96,10 @@ describe('Stock Evaluation Engine', () => {
       };
     });
 
-    // Mock enqueue to fail by injecting a failing prepare on D1 or breaking the database constraint
-    // For TDD rollback, let's temporarily break the notification_queue insert by removing the table or altering it, 
-    // or just let evaluation throw by making the database read-only/closed, or by mocking db.prepare to throw.
+    // Force the queue insert in the atomic D1 batch to fail.
     const originalPrepare = db.prepare;
     db.prepare = function(sql) {
-      if (sql.includes('INSERT OR IGNORE INTO notification_queue')) {
+      if (sql.includes('INSERT INTO notification_queue')) {
         return {
           bind: () => ({
             run: () => {
@@ -315,6 +314,31 @@ describe('Stock Evaluation Engine', () => {
     const { results } = await db.prepare("SELECT * FROM notification_queue WHERE kind = 'stock'").all();
     expect(results).toHaveLength(1);
     expect(results[0].dedupe_key).toBe('stock:rule:1:1');
+  });
+
+  it('allows only one concurrent evaluation to trigger the same arm', async () => {
+    await addTrackerRule(db, {
+      providerType: 'stock', targetKey: 'sh600519', targetConfig: {},
+      conditionType: 'gte', conditionValue: 1700
+    });
+    const mockFetch = vi.fn(async () => ({
+      status: 200,
+      text: async () => 'v_sh600519="1~贵州茅台~600519~1750.00~1710.00~1715.00~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713100000~0";'
+    }));
+    const options = {
+      fetchFn: mockFetch,
+      relativeTo: new Date('2026-07-13T10:00:00+08:00'),
+      forceTradingSession: true
+    };
+
+    const counts = await Promise.all([
+      evaluateRules(db, {}, options),
+      evaluateRules(db, {}, options)
+    ]);
+
+    expect(counts.reduce((sum, count) => sum + count, 0)).toBe(1);
+    expect((await db.prepare("SELECT * FROM notification_queue WHERE kind = 'stock'").all()).results).toHaveLength(1);
+    expect(await getTrackerEvents(db, 1)).toHaveLength(1);
   });
 
   it('should use Beijing date rather than UTC date for stock-provider daily warning dedupe (Beijing date)', async () => {

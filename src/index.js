@@ -630,9 +630,14 @@ app.post('/telegram', async c => {
   const msg = update.message;
   if (!msg?.text) return c.text('ok');
 
-  const chatId = msg.chat.id;
+  const chatId = msg.chat?.id;
   const token = c.env.TELEGRAM_BOT_TOKEN;
   const allowedChat = c.env.TELEGRAM_CHAT_ID;
+
+  if (msg.chat?.type !== 'private') {
+    logWarn('telegram.chat_type_rejected', { chatType: msg.chat?.type });
+    return c.text('ok');
+  }
 
   if (String(chatId) !== String(allowedChat)) {
     logWarn('telegram.chat_rejected', { chatId });
@@ -640,7 +645,7 @@ app.post('/telegram', async c => {
   }
 
   const adminUserId = c.env.TELEGRAM_ADMIN_USER_ID;
-  if (adminUserId && String(msg.from?.id || '') !== String(adminUserId)) {
+  if (!adminUserId || String(msg.from?.id || '') !== String(adminUserId)) {
     logWarn('telegram.user_rejected', { fromUserId: msg.from?.id });
     return c.text('ok');
   }
@@ -700,6 +705,7 @@ async function processAddRss(db, url, env, chatId, token) {
   try {
     const res = await safeFetch(url, {
       timeoutMs: 8000,
+      ...(env.SAFE_FETCH_RESOLVER ? { resolver: env.SAFE_FETCH_RESOLVER } : {}),
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; PersonalRSS/2.0; +https://github.com/CI2VO5IXZ7/personalrss)'
       }
@@ -743,7 +749,10 @@ async function processAddRss(db, url, env, chatId, token) {
   try {
     let feedXml = responseText;
     if (isHtml) {
-      const feedRes = await safeFetch(finalUrl, { timeoutMs: 5000 });
+      const feedRes = await safeFetch(finalUrl, {
+        timeoutMs: 5000,
+        ...(env.SAFE_FETCH_RESOLVER ? { resolver: env.SAFE_FETCH_RESOLVER } : {})
+      });
       feedXml = await feedRes.text();
     }
     parsed = await parseFeed(feedXml, '');
