@@ -70,6 +70,7 @@ Cloudflare Worker
 | `FALLBACK_REFRESH_FAILURE_THRESHOLD` | 否 | `3` | 连续命中风控状态码达到该次数后触发一次 HTTP 兜底刷新 |
 | `FALLBACK_REFRESH_HTTP_STATUSES` | 否 | `401,403,429` | 触发兜底的 Instagram HTTP 状态码列表（逗号分隔） |
 | `FALLBACK_REFRESH_URL_BASE` | 否 | 同 `BASE_URL` | 兜底刷新请求使用的基础域名，默认复用 `BASE_URL` |
+| `DEEPSEEK_DAILY_LIMIT` | 否 | `200` | 每日 DeepSeek 摘要的调用额度软上限（超额自动使用原摘要降级） |
 
 ### 3. Worker Secrets
 
@@ -77,9 +78,13 @@ Cloudflare Worker
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Telegram 功能必填 | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | Telegram 功能必填 | 允许操作机器人的目标 Chat ID |
+| `TELEGRAM_BOT_TOKEN` | Telegram 功能必填 | 管理 Bot Token |
+| `TELEGRAM_CHAT_ID` | Telegram 功能必填 | 允许操作管理 Bot 接收消息/命令的目标 Chat ID |
+| `TELEGRAM_ADMIN_USER_ID` | 否 | 管理员的个人 Telegram User ID，配置后限制其他用户在同一 chat 中执行命令 |
 | `ADMIN_TOKEN` | 是 | 管理接口认证 Token，同时也作为 Telegram Webhook Secret Token |
+| `PUSH_TELEGRAM_BOT_TOKEN` | 是 | 专用于向私人频道推送内容的新 Bot Token |
+| `PUSH_TELEGRAM_CHANNEL_ID` | 是 | 接收内容推送的目标私人频道 ID (e.g. -100xxx) |
+| `DEEPSEEK_API_KEY` | 否 | DeepSeek API 密钥，不配置则不进行 AI 摘要生成并使用原摘要 |
 
 ## 部署
 
@@ -147,6 +152,7 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 | `POST` | `/admin/refresh_ig/:username` | `Authorization: Bearer <ADMIN_TOKEN>` | 刷新单个 Instagram 账号（也是 HTTP 兜底刷新的内部目标） |
 | `POST` | `/admin/sync-telegram-commands` | `Authorization: Bearer <ADMIN_TOKEN>` | 单独同步 Telegram 命令菜单 |
 | `GET` | `/admin/probe-instagram` | `Authorization: Bearer <ADMIN_TOKEN>` | Instagram 探针诊断（只读，不写缓存） |
+| `GET` | `/admin/probe-stock` | `Authorization: Bearer <ADMIN_TOKEN>` | 股票价格探针诊断（只读，不写 D1） |
 
 ### 已关闭的公开页面
 
@@ -159,21 +165,44 @@ curl -X POST "https://<your-worker-domain>/setup-webhook" \
 
 ## Telegram 命令
 
-### 订阅管理
+### Instagram 订阅管理
 
 | 命令 | 说明 |
 | --- | --- |
 | `/add_ig <username> [displayName]` | 添加 Instagram 订阅 |
 | `/remove_ig <username>` | 删除 Instagram 订阅 |
-| `/list` | 列出当前全部订阅 |
+| `/list` | 列出当前全部 Instagram 订阅 |
+
+### RSS 订阅管理
+
+| 命令 | 说明 |
+| --- | --- |
+| `/rss_add [url]` | 添加 RSS/Atom 订阅（无参数时进入会话订阅流程） |
+| `/rss_list` | 列出当前全部 RSS 订阅 |
+| `/rss_remove <id>` | 删除指定 ID 的 RSS 订阅 |
+| `/rss_pause <id>` | 暂停指定 ID 的 RSS 订阅 |
+| `/rss_resume <id>` | 恢复指定 ID 的 RSS 订阅 |
+| `/rss_refresh <id>` | 手动刷新指定 ID 的 RSS 订阅 |
+| `/rss_set_interval <id> <minutes>` | 设置指定 ID 的 RSS 订阅检测刷新间隔（分钟，最小为 5 分钟） |
+
+### 股票价格追踪
+
+| 命令 | 说明 |
+| --- | --- |
+| `/stock_add <code> [gte/lte] [targetPrice]` | 添加股票价格提醒（支持 6 位代码，如 600519，无参数时进入会话订阅流程） |
+| `/stock_list` | 列出当前全部股票价格提醒 |
+| `/stock_pause <id>` | 暂停指定 ID 的股票提醒 |
+| `/stock_resume <id>` | 恢复指定 ID 的股票提醒 |
+| `/stock_remove <id>` | 删除指定 ID 的股票提醒 |
+| `/stock_quote <code>` | 查询当前股票价格行情 |
 
 ### 运维命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `/feeds` | 列出所有 RSS 链接 |
-| `/status` | 查看服务状态、抓取摘要和异常账号 |
-| `/refresh` | 手动刷新全部缓存 |
+| `/feeds` | 列出所有 Instagram RSS 链接 |
+| `/status` | 查看服务状态，包括 Instagram/RSS 订阅状态、通知队列积压、股票提醒积压及当日 AI 额度使用 |
+| `/refresh` | 手动刷新全部 Instagram 缓存 |
 | `/refresh_ig <username>` | 刷新单个 Instagram 订阅 |
 | `/purge_ig` | 清理全部 Instagram 缓存 |
 | `/sync_commands` | 同步 Telegram 机器人命令菜单 |

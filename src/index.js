@@ -554,6 +554,64 @@ app.get('/admin/probe-instagram', async c => {
   });
 });
 
+// ─── Admin: Stock 探针诊断（只读，不写 D1） ────────────────────────────────────
+app.get('/admin/probe-stock', async c => {
+  const unauthorized = requireAdmin(c);
+  if (unauthorized) return unauthorized;
+
+  const codeQuery = (c.req.query('code') || '').trim();
+  const colo = c.req.raw.cf?.colo || null;
+  const ray = c.req.header('cf-ray') || null;
+
+  if (!codeQuery) {
+    return c.json({ ok: false, error: 'missing code', colo, ray, timestamp: new Date().toISOString() }, 400);
+  }
+
+  const { normalizeSymbol, fetchStockQuotes } = await import('./trackers/providers/stock.js');
+  const code = normalizeSymbol(codeQuery);
+  if (!code) {
+    return c.json({ ok: false, error: 'invalid symbol format', colo, ray, timestamp: new Date().toISOString() }, 400);
+  }
+
+  logInfo('probe.stock.start', { code, colo });
+
+  const startedAt = Date.now();
+  let ok = false;
+  let quote = null;
+  let error = null;
+
+  try {
+    const quotes = await fetchStockQuotes([code], { fetchFn: fetch });
+    quote = quotes[code];
+    if (quote) {
+      ok = true;
+    } else {
+      error = 'no quote returned';
+    }
+  } catch (e) {
+    error = truncate(e?.message || 'probe failed', 200);
+  }
+
+  const durationMs = Date.now() - startedAt;
+
+  if (ok) {
+    logInfo('probe.stock.finish', { code, colo, durationMs });
+  } else {
+    logWarn('probe.stock.failure', { code, colo, durationMs, error });
+  }
+
+  return c.json({
+    ok,
+    code,
+    quote,
+    durationMs,
+    colo,
+    ray,
+    error,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // ─── Telegram Webhook ─────────────────────────────────────────────────────────
 
 app.post('/telegram', async c => {
@@ -581,12 +639,260 @@ app.post('/telegram', async c => {
     return c.text('ok');
   }
 
+  const adminUserId = c.env.TELEGRAM_ADMIN_USER_ID;
+  if (adminUserId && String(msg.from?.id || '') !== String(adminUserId)) {
+    logWarn('telegram.user_rejected', { fromUserId: msg.from?.id });
+    return c.text('ok');
+  }
+
+  const db = c.env.DB;
+  const { getBotSession, clearBotSession } = await import('./db.js');
+  const session = await getBotSession(db, chatId);
+
+  if (session) {
+    const parsed = parseCommand(msg.text);
+    if (parsed && parsed.cmd === 'cancel') {
+      await clearBotSession(db, chatId);
+      await sendMessage(token, chatId, '✅ 已取消订阅流程。');
+      return c.text('ok');
+    }
+    c.executionCtx.waitUntil(handleSessionMessage(session, msg.text, c.env, chatId, token));
+    return c.text('ok');
+  }
+
   const parsed = parseCommand(msg.text);
   if (!parsed) return c.text('ok');
 
   c.executionCtx.waitUntil(handleCommand(parsed, c.env, chatId, token));
   return c.text('ok');
 });
+
+// ─── Bot Session Helpers ──────────────────────────────────────────────────────
+
+async function processAddRss(db, url, env, chatId, token) {
+  const { isSafeUrl, redactUrl, safeFetch, redactText } = await import('./security/url.js');
+  const { discoverFeeds } = await import('./rss/discovery.js');
+  const { parseFeed } = await import('./rss/parser.js');
+  const { processSubscription } = await import('./rss/scheduler.js');
+  const { addRssSubscription, getRssSubscriptionByUrl, clearBotSession } = await import('./db.js');
+
+  if (!isSafeUrl(url)) {
+    await sendMessage(token, chatId, '❌ 订阅链接不安全，禁止订阅该地址。');
+    await clearBotSession(db, chatId);
+    return;
+  }
+
+  const redacted = redactUrl(url);
+  const existing = await getRssSubscriptionByUrl(db, url);
+  if (existing) {
+    await sendMessage(token, chatId, `⚠️ 订阅已存在：<code>${escapeHtml(redacted)}</code>`);
+    await clearBotSession(db, chatId);
+    return;
+  }
+
+  await sendMessage(token, chatId, `🔎 正在检测订阅源 <code>${escapeHtml(redacted)}</code>...`);
+
+  let finalUrl = url;
+  let isHtml = false;
+  let responseText = '';
+  let contentType = '';
+
+  try {
+    const res = await safeFetch(url, {
+      timeoutMs: 8000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; PersonalRSS/2.0; +https://github.com/CI2VO5IXZ7/personalrss)'
+      }
+    });
+
+    contentType = res.headers.get('content-type') || '';
+    responseText = await res.text();
+
+    if (contentType.includes('text/html')) {
+      isHtml = true;
+    }
+  } catch (e) {
+    await sendMessage(token, chatId, `❌ 无法访问该链接：${escapeHtml(redactText(e.message))}`);
+    await clearBotSession(db, chatId);
+    return;
+  }
+
+  if (isHtml) {
+    const discovered = discoverFeeds(responseText, url);
+    if (discovered.length === 0) {
+      await sendMessage(token, chatId, '❌ 未能在网页中发现任何 RSS/Atom 订阅源。');
+      await clearBotSession(db, chatId);
+      return;
+    }
+    finalUrl = discovered[0].url;
+    if (!isSafeUrl(finalUrl)) {
+      await sendMessage(token, chatId, '❌ 发现的订阅源链接不安全，禁止订阅该地址。');
+      await clearBotSession(db, chatId);
+      return;
+    }
+    const existingDiscovered = await getRssSubscriptionByUrl(db, finalUrl);
+    if (existingDiscovered) {
+      await sendMessage(token, chatId, `⚠️ 发现订阅源 <code>${escapeHtml(redactUrl(finalUrl))}</code>，但该订阅已存在。`);
+      await clearBotSession(db, chatId);
+      return;
+    }
+    await sendMessage(token, chatId, `ℹ️ 网页中发现订阅源，将订阅第一个：<code>${escapeHtml(redactUrl(finalUrl))}</code>`);
+  }
+
+  let parsed;
+  try {
+    let feedXml = responseText;
+    if (isHtml) {
+      const feedRes = await safeFetch(finalUrl, { timeoutMs: 5000 });
+      feedXml = await feedRes.text();
+    }
+    parsed = await parseFeed(feedXml, '');
+  } catch (e) {
+    await sendMessage(token, chatId, `❌ 订阅源解析失败：${escapeHtml(redactText(e.message))}`);
+    await clearBotSession(db, chatId);
+    return;
+  }
+
+  const title = parsed.title || 'Untitled Feed';
+  const siteUrl = parsed.siteUrl || '';
+
+  const added = await addRssSubscription(db, finalUrl, redactUrl(finalUrl), siteUrl, title, 10);
+  if (added) {
+    const newSub = await getRssSubscriptionByUrl(db, finalUrl);
+    await processSubscription(db, newSub, env);
+
+    await sendMessage(token, chatId,
+      `✅ 成功订阅 RSS：<b>${escapeHtml(title)}</b>\n\n` +
+      `ID: <b>${newSub.id}</b>\n` +
+      `链接：<code>${escapeHtml(redactUrl(finalUrl))}</code>\n` +
+      `检测间隔：<b>10</b> 分钟（已建立首次基线，不推送历史条目）`
+    );
+  } else {
+    await sendMessage(token, chatId, '❌ 订阅保存失败。');
+  }
+
+  await clearBotSession(db, chatId);
+}
+
+async function handleSessionMessage(session, text, env, chatId, token) {
+  const db = env.DB;
+  if (session.flow === 'rss_add' && session.step === 'await_url') {
+    const url = text.trim();
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      await sendMessage(token, chatId, '❌ 链接格式错误。请输入以 http:// 或 https:// 开头的链接：\n(发送 /cancel 退出流程)');
+      return;
+    }
+    await processAddRss(db, url, env, chatId, token);
+  } else if (session.flow === 'stock_add') {
+    const input = text.trim();
+    const { normalizeSymbol, fetchStockQuotes } = await import('./trackers/providers/stock.js');
+    const { addTrackerRule, clearBotSession, setBotSession } = await import('./db.js');
+
+    if (session.step === 'await_code') {
+      const code = normalizeSymbol(input);
+      if (!code) {
+        await sendMessage(token, chatId, '❌ 无效的股票代码，请重新输入（支持 6 位代码，如 600519 或 sz000001）：\n(发送 /cancel 退出)');
+        return;
+      }
+      await sendMessage(token, chatId, `🔎 正在查询股票 <code>${escapeHtml(code)}</code> 行情...`);
+      let quotes;
+      try {
+        quotes = await fetchStockQuotes([code], { fetchFn: fetch });
+      } catch (err) {
+        await sendMessage(token, chatId, `❌ 查询行情失败：${escapeHtml(err.message)}`);
+        await clearBotSession(db, chatId);
+        return;
+      }
+      const quote = quotes[code];
+      if (!quote) {
+        await sendMessage(token, chatId, `❌ 无法获取股票 <code>${escapeHtml(code)}</code> 的当前价格。`);
+        await clearBotSession(db, chatId);
+        return;
+      }
+      const currentPrice = quote.latestPrice;
+      const sessionData = {
+        code,
+        currentPrice,
+        source: quote.source,
+        observedAt: quote.timestamp
+      };
+
+      const expiresAt = new Date(Date.now() + 300 * 1000).toISOString();
+      await setBotSession(db, chatId, 'stock_add', 'await_condition_price', sessionData, expiresAt);
+
+      await sendMessage(token, chatId,
+        `📈 股票：<code>${escapeHtml(code)}</code>\n` +
+        `当前价格：<b>${currentPrice}</b>\n\n` +
+        `请输入阈值条件和目标价格（例如：<code>gte 1800</code> 或 <code>lte 10</code>）：\n(发送 /cancel 退出)`
+      );
+    } else if (session.step === 'await_condition_price') {
+      const parts = input.toLowerCase().split(/\s+/);
+      const condition = parts[0];
+      const targetPrice = parseFloat(parts[1]);
+      if ((condition !== 'gte' && condition !== 'lte') || isNaN(targetPrice) || targetPrice <= 0) {
+        await sendMessage(token, chatId, '❌ 格式错误。请输入正确的条件和目标价格（如 <code>gte 1800</code> 或 <code>lte 10</code>）：\n(发送 /cancel 退出)');
+        return;
+      }
+
+      const sessionData = JSON.parse(session.data_json);
+      const code = sessionData.code;
+      const currentPrice = sessionData.currentPrice;
+
+      let satisfied = false;
+      if (condition === 'gte') {
+        satisfied = currentPrice >= targetPrice;
+      } else if (condition === 'lte') {
+        satisfied = currentPrice <= targetPrice;
+      }
+
+      if (satisfied) {
+        const nextData = { ...sessionData, condition, targetPrice };
+        const expiresAt = new Date(Date.now() + 300 * 1000).toISOString();
+        await setBotSession(db, chatId, 'stock_add', 'await_confirmation', nextData, expiresAt);
+        await sendMessage(token, chatId,
+          `⚠️ 当前价格为 <b>${currentPrice}</b>，已满足阈值条件 <b>${condition === 'gte' ? '≥' : '≤'} ${targetPrice}</b>！\n` +
+          `是否确认创建该规则？（发送 “确认” 或 “yes” 确认，发送 /cancel 取消）`
+        );
+      } else {
+        const ok = await addTrackerRule(db, {
+          providerType: 'stock',
+          targetKey: code,
+          targetConfig: { code },
+          conditionType: condition,
+          conditionValue: targetPrice,
+          status: 'active'
+        });
+        if (ok) {
+          await sendMessage(token, chatId, `✅ 已成功添加股票提醒规则：<code>${escapeHtml(code)}</code> ${condition === 'gte' ? '≥' : '≤'} ${targetPrice}`);
+        } else {
+          await sendMessage(token, chatId, '❌ 添加股票提醒规则失败。');
+        }
+        await clearBotSession(db, chatId);
+      }
+    } else if (session.step === 'await_confirmation') {
+      if (input === '确认' || input.toLowerCase() === 'yes') {
+        const sessionData = JSON.parse(session.data_json);
+        const { code, condition, targetPrice } = sessionData;
+        const ok = await addTrackerRule(db, {
+          providerType: 'stock',
+          targetKey: code,
+          targetConfig: { code },
+          conditionType: condition,
+          conditionValue: targetPrice,
+          status: 'active'
+        });
+        if (ok) {
+          await sendMessage(token, chatId, `✅ 已成功添加股票提醒规则：<code>${escapeHtml(code)}</code> ${condition === 'gte' ? '≥' : '≤'} ${targetPrice}`);
+        } else {
+          await sendMessage(token, chatId, '❌ 添加股票提醒规则失败。');
+        }
+        await clearBotSession(db, chatId);
+      } else {
+        await sendMessage(token, chatId, '❌ 输入不符合要求。请输入 “确认” 或 “yes” 确认创建，或发送 /cancel 退出流程。');
+      }
+    }
+  }
+}
 
 // ─── Telegram 命令处理 ────────────────────────────────────────────────────────
 
@@ -675,26 +981,53 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
           .sort((a, b) => (b.consecutive_failures || 0) - (a.consecutive_failures || 0))
           .slice(0, 5);
 
+        // Fetch RSS stats
+        const rssActive = (await db.prepare("SELECT COUNT(*) as count FROM rss_subscriptions WHERE status = 'active'").first())?.count || 0;
+        const rssPaused = (await db.prepare("SELECT COUNT(*) as count FROM rss_subscriptions WHERE status = 'paused'").first())?.count || 0;
+        const rssError = (await db.prepare("SELECT COUNT(*) as count FROM rss_subscriptions WHERE status = 'error'").first())?.count || 0;
+
+        // Fetch Stock stats
+        const stockActive = (await db.prepare("SELECT COUNT(*) as count FROM tracker_rules WHERE status = 'active'").first())?.count || 0;
+        const stockTriggered = (await db.prepare("SELECT COUNT(*) as count FROM tracker_rules WHERE status = 'triggered'").first())?.count || 0;
+        const stockPending = (await db.prepare("SELECT COUNT(*) as count FROM tracker_rules WHERE status = 'trigger_pending'").first())?.count || 0;
+
+        // Fetch Notifications stats
+        const notifyPending = (await db.prepare("SELECT COUNT(*) as count FROM notification_queue WHERE status = 'pending'").first())?.count || 0;
+        const notifyDead = (await db.prepare("SELECT COUNT(*) as count FROM notification_queue WHERE status = 'dead'").first())?.count || 0;
+
+        // Fetch DeepSeek usage
+        const { getBeijingDate } = await import('./summary/deepseek.js');
+        const dateStr = getBeijingDate();
+        const dsUsage = await db.prepare("SELECT count FROM daily_usage WHERE usage_date = ? AND usage_type = 'deepseek_summary'").bind(dateStr).first();
+        const dsCount = dsUsage?.count || 0;
+        const dsLimit = parseInt(env.DEEPSEEK_DAILY_LIMIT || '200', 10);
+
         let msg = '📊 <b>服务状态</b>\n\n';
-        msg += `Instagram：<b>${igAccounts.length}</b> 个订阅\n`;
+        msg += `📸 <b>Instagram</b>\n`;
+        msg += `订阅账号：<b>${igAccounts.length}</b> 个\n`;
 
         if (statuses.length > 0) {
-          msg += '\n<b>最近抓取结果</b>\n';
-          msg += `更新成功：${summary.updated}\n`;
-          msg += `无新更新：${summary.no_new_posts}\n`;
-          msg += `暂无内容：${summary.no_posts}\n`;
-          msg += `抓取失败：${summary.error}\n`;
+          msg += `更新成功：${summary.updated} | 无新更新：${summary.no_new_posts} | 暂无内容：${summary.no_posts} | 抓取失败：${summary.error}\n`;
         }
 
         if (failures.length > 0) {
-          msg += '\n<b>异常账号</b>\n';
+          msg += '异常账号：\n';
           for (const item of failures) {
-            msg += `IG <code>${escapeHtml(item.user_id)}</code>: 连续失败 ${item.consecutive_failures} 次\n`;
-            if (item.last_error) {
-              msg += `${escapeHtml(truncate(item.last_error, 80))}\n`;
-            }
+            msg += `  - <code>${escapeHtml(item.user_id)}</code>: 连续失败 ${item.consecutive_failures} 次\n`;
           }
         }
+
+        msg += `\n📰 <b>RSS 订阅</b>\n`;
+        msg += `活跃：<b>${rssActive}</b> | 暂停：<b>${rssPaused}</b> | 异常：<b>${rssError}</b>\n`;
+
+        msg += `\n📈 <b>股票提醒</b>\n`;
+        msg += `活跃：<b>${stockActive}</b> | 已触发：<b>${stockTriggered}</b> | 待发送：<b>${stockPending}</b>\n`;
+
+        msg += `\n✉️ <b>通知队列</b>\n`;
+        msg += `积压 (pending)：<b>${notifyPending}</b> | 失败 (dead)：<b>${notifyDead}</b>\n`;
+
+        msg += `\n🤖 <b>AI 摘要 (DeepSeek)</b>\n`;
+        msg += `今日已用：<b>${dsCount}</b> / ${dsLimit}\n`;
 
         await sendMessage(token, chatId, msg);
         break;
@@ -740,6 +1073,372 @@ async function handleCommand({ cmd, args }, env, chatId, token) {
         break;
       }
 
+      case 'rss_add': {
+        if (args[0]) {
+          const url = args[0].trim();
+          await processAddRss(db, url, env, chatId, token);
+        } else {
+          const { setBotSession } = await import('./db.js');
+          const expiresAt = new Date(Date.now() + 300 * 1000).toISOString(); // 5 min expiry
+          await setBotSession(db, chatId, 'rss_add', 'await_url', {}, expiresAt);
+          await sendMessage(token, chatId, '请输入您要订阅的 RSS/Atom 订阅源链接或网页链接：\n(发送 /cancel 退出流程)');
+        }
+        break;
+      }
+
+      case 'rss_list': {
+        const { getRssSubscriptions } = await import('./db.js');
+        const subs = await getRssSubscriptions(db);
+        if (subs.length === 0) {
+          await sendMessage(token, chatId, '📭 暂无 RSS 订阅，使用 /rss_add 添加。');
+          break;
+        }
+        let msg = '📋 <b>RSS 订阅列表</b>\n\n';
+        for (const s of subs) {
+          msg += `ID: <b>${s.id}</b> - ${escapeHtml(s.title || '未命名')} (${escapeHtml(s.status)}, ${s.interval_minutes}m)\n`;
+          msg += `URL: <code>${escapeHtml(s.feed_url_redacted)}</code>\n\n`;
+        }
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'rss_remove': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/rss_remove <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (Number.isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/rss_remove <id>');
+          break;
+        }
+        const { getRssSubscription, removeRssSubscription } = await import('./db.js');
+        const sub = await getRssSubscription(db, id);
+        if (!sub) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的订阅。`);
+          break;
+        }
+        const ok = await removeRssSubscription(db, id);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功删除 RSS 订阅：<b>${escapeHtml(sub.title)}</b>`
+          : `⚠️ 删除失败：<b>${escapeHtml(sub.title)}</b>`
+        );
+        break;
+      }
+
+      case 'rss_pause': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/rss_pause <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (Number.isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/rss_pause <id>');
+          break;
+        }
+        const { getRssSubscription, pauseRssSubscription } = await import('./db.js');
+        const sub = await getRssSubscription(db, id);
+        if (!sub) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的订阅。`);
+          break;
+        }
+        const ok = await pauseRssSubscription(db, id);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功暂停 RSS 订阅：<b>${escapeHtml(sub.title)}</b>`
+          : `⚠️ 暂停失败：<b>${escapeHtml(sub.title)}</b>`
+        );
+        break;
+      }
+
+      case 'rss_resume': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/rss_resume <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (Number.isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/rss_resume <id>');
+          break;
+        }
+        const { getRssSubscription, resumeRssSubscription } = await import('./db.js');
+        const sub = await getRssSubscription(db, id);
+        if (!sub) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的订阅。`);
+          break;
+        }
+        const ok = await resumeRssSubscription(db, id);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功恢复 RSS 订阅：<b>${escapeHtml(sub.title)}</b>`
+          : `⚠️ 恢复失败：<b>${escapeHtml(sub.title)}</b>`
+        );
+        break;
+      }
+
+      case 'rss_refresh': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/rss_refresh <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (Number.isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/rss_refresh <id>');
+          break;
+        }
+        const { getRssSubscription } = await import('./db.js');
+        const sub = await getRssSubscription(db, id);
+        if (!sub) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的订阅。`);
+          break;
+        }
+        await sendMessage(token, chatId, `🔄 正在手动刷新 RSS 订阅：<b>${escapeHtml(sub.title)}</b>...`);
+        const { processSubscription } = await import('./rss/scheduler.js');
+        const res = await processSubscription(db, sub, env);
+        if (res.success) {
+          await sendMessage(token, chatId, `✅ 刷新完成！发现并入队了 <b>${res.count}</b> 条新文章。`);
+        } else {
+          await sendMessage(token, chatId, `❌ 刷新失败：${escapeHtml(res.error)}`);
+        }
+        break;
+      }
+
+      case 'rss_set_interval': {
+        if (!args[0] || !args[1]) {
+          await sendMessage(token, chatId, '❌ 用法：/rss_set_interval <id> <minutes>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        const minutes = parseInt(args[1].trim(), 10);
+        if (Number.isNaN(id) || Number.isNaN(minutes) || minutes < 5) {
+          await sendMessage(token, chatId, '❌ 无效参数。刷新间隔最小为 5 分钟。用法：/rss_set_interval <id> <minutes>');
+          break;
+        }
+        const { getRssSubscription, updateRssSubscriptionInterval } = await import('./db.js');
+        const sub = await getRssSubscription(db, id);
+        if (!sub) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的订阅。`);
+          break;
+        }
+        const ok = await updateRssSubscriptionInterval(db, id, minutes);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已将 RSS 订阅 <b>${escapeHtml(sub.title)}</b> 的检测周期设置为 <b>${minutes}</b> 分钟。`
+          : `⚠️ 设置失败：<b>${escapeHtml(sub.title)}</b>`
+        );
+        break;
+      }
+
+      case 'stock_quote': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/stock_quote <code>');
+          break;
+        }
+        const input = args[0].trim();
+        const { normalizeSymbol, fetchStockQuotes } = await import('./trackers/providers/stock.js');
+        const code = normalizeSymbol(input);
+        if (!code) {
+          await sendMessage(token, chatId, '❌ 无效的股票代码。用法：/stock_quote <code>');
+          break;
+        }
+        await sendMessage(token, chatId, `🔎 正在查询 <code>${escapeHtml(code)}</code> 行情...`);
+        try {
+          const quotes = await fetchStockQuotes([code], { fetchFn: fetch });
+          const q = quotes[code];
+          if (!q) {
+            await sendMessage(token, chatId, `❌ 无法获取 <code>${escapeHtml(code)}</code> 的行情。`);
+            break;
+          }
+          const change = q.latestPrice - q.yesterdayClose;
+          const pct = ((change / q.yesterdayClose) * 100).toFixed(2);
+          const sign = change > 0 ? '+' : '';
+
+          await sendMessage(token, chatId,
+            `📈 <b>股票行情: ${escapeHtml(code)}</b>\n\n` +
+            `最新价: <b>${q.latestPrice}</b>\n` +
+            `昨收价: <b>${q.yesterdayClose}</b>\n` +
+            `涨跌幅: <b>${sign}${pct}%</b>\n` +
+            `更新时间: <code>${escapeHtml(q.timestamp)}</code>\n` +
+            `数据源: <code>${escapeHtml(q.source)}</code>`
+          );
+        } catch (err) {
+          await sendMessage(token, chatId, `❌ 查询失败：${escapeHtml(err.message)}`);
+        }
+        break;
+      }
+
+      case 'stock_add': {
+        const { normalizeSymbol, fetchStockQuotes } = await import('./trackers/providers/stock.js');
+        const { addTrackerRule, setBotSession } = await import('./db.js');
+
+        if (args[0] && args[1] && args[2]) {
+          const code = normalizeSymbol(args[0].trim());
+          const condition = args[1].trim().toLowerCase();
+          const targetPrice = parseFloat(args[2].trim());
+
+          if (!code) {
+            await sendMessage(token, chatId, '❌ 无效的股票代码。');
+            break;
+          }
+          if (condition !== 'gte' && condition !== 'lte') {
+            await sendMessage(token, chatId, '❌ 条件必须为 gte 或 lte。');
+            break;
+          }
+          if (isNaN(targetPrice) || targetPrice <= 0) {
+            await sendMessage(token, chatId, '❌ 目标价必须是正数。');
+            break;
+          }
+
+          await sendMessage(token, chatId, `🔎 正在查询 <code>${escapeHtml(code)}</code> 行情...`);
+          let quotes;
+          try {
+            quotes = await fetchStockQuotes([code], { fetchFn: fetch });
+          } catch (err) {
+            await sendMessage(token, chatId, `❌ 查询行情失败：${escapeHtml(err.message)}`);
+            break;
+          }
+          const q = quotes[code];
+          if (!q) {
+            await sendMessage(token, chatId, `❌ 无法获取当前行情，添加失败。`);
+            break;
+          }
+
+          const currentPrice = q.latestPrice;
+          let satisfied = false;
+          if (condition === 'gte') {
+            satisfied = currentPrice >= targetPrice;
+          } else if (condition === 'lte') {
+            satisfied = currentPrice <= targetPrice;
+          }
+
+          if (satisfied) {
+            const sessionData = {
+              code,
+              currentPrice,
+              condition,
+              targetPrice,
+              source: q.source,
+              observedAt: q.timestamp
+            };
+            const expiresAt = new Date(Date.now() + 300 * 1000).toISOString();
+            await setBotSession(db, chatId, 'stock_add', 'await_confirmation', sessionData, expiresAt);
+            await sendMessage(token, chatId,
+              `⚠️ 当前价格为 <b>${currentPrice}</b>，已满足阈值条件 <b>${condition === 'gte' ? '≥' : '≤'} ${targetPrice}</b>！\n` +
+              `是否确认创建该规则？（发送 “确认” 或 “yes” 确认，发送 /cancel 取消）`
+            );
+          } else {
+            const ok = await addTrackerRule(db, {
+              providerType: 'stock',
+              targetKey: code,
+              targetConfig: { code },
+              conditionType: condition,
+              conditionValue: targetPrice,
+              status: 'active'
+            });
+            if (ok) {
+              await sendMessage(token, chatId, `✅ 已成功添加股票提醒规则：<code>${escapeHtml(code)}</code> ${condition === 'gte' ? '≥' : '≤'} ${targetPrice}`);
+            } else {
+              await sendMessage(token, chatId, '❌ 添加股票提醒规则失败。');
+            }
+          }
+        } else {
+          const expiresAt = new Date(Date.now() + 300 * 1000).toISOString();
+          await setBotSession(db, chatId, 'stock_add', 'await_code', {}, expiresAt);
+          await sendMessage(token, chatId, '请输入股票代码（例如 600519 或 sz000001）：\n(发送 /cancel 退出流程)');
+        }
+        break;
+      }
+
+      case 'stock_list': {
+        const { getTrackerRules } = await import('./db.js');
+        const rules = await getTrackerRules(db);
+        const stockRules = rules.filter(r => r.provider_type === 'stock');
+        if (stockRules.length === 0) {
+          await sendMessage(token, chatId, '📭 暂无股票提醒，使用 /stock_add 添加。');
+          break;
+        }
+        let msg = '📋 <b>股票提醒列表</b>\n\n';
+        for (const r of stockRules) {
+          const cond = r.condition_type === 'gte' ? 'gte (≥)' : 'lte (≤)';
+          msg += `ID: <b>${r.id}</b> - <code>${escapeHtml(r.target_key)}</code> ${cond} <b>${r.condition_value}</b> (${escapeHtml(r.status)})\n`;
+          if (r.last_value !== null) {
+            msg += `最新值: <b>${r.last_value}</b> (时间: ${escapeHtml(r.last_observed_at || '')})\n`;
+          }
+          msg += '\n';
+        }
+        await sendMessage(token, chatId, msg);
+        break;
+      }
+
+      case 'stock_pause': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/stock_pause <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/stock_pause <id>');
+          break;
+        }
+        const { getTrackerRule, updateTrackerRuleStatus } = await import('./db.js');
+        const rule = await getTrackerRule(db, id);
+        if (!rule) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的规则。`);
+          break;
+        }
+        const ok = await updateTrackerRuleStatus(db, id, 'paused');
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功暂停股票提醒规则 ID: <b>${id}</b>`
+          : `⚠️ 暂停失败。`
+        );
+        break;
+      }
+
+      case 'stock_resume': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/stock_resume <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/stock_resume <id>');
+          break;
+        }
+        const { getTrackerRule, updateTrackerRuleStatus } = await import('./db.js');
+        const rule = await getTrackerRule(db, id);
+        if (!rule) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的规则。`);
+          break;
+        }
+        const ok = await updateTrackerRuleStatus(db, id, 'active');
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功恢复股票提醒规则 ID: <b>${id}</b>`
+          : `⚠️ 恢复失败。`
+        );
+        break;
+      }
+
+      case 'stock_remove': {
+        if (!args[0]) {
+          await sendMessage(token, chatId, '❌ 用法：/stock_remove <id>');
+          break;
+        }
+        const id = parseInt(args[0].trim(), 10);
+        if (isNaN(id)) {
+          await sendMessage(token, chatId, '❌ 无效的 ID。用法：/stock_remove <id>');
+          break;
+        }
+        const { getTrackerRule, removeTrackerRule } = await import('./db.js');
+        const rule = await getTrackerRule(db, id);
+        if (!rule) {
+          await sendMessage(token, chatId, `⚠️ 未找到 ID 为 <b>${id}</b> 的规则。`);
+          break;
+        }
+        const ok = await removeTrackerRule(db, id);
+        await sendMessage(token, chatId, ok
+          ? `✅ 已成功删除股票提醒规则 ID: <b>${id}</b>`
+          : `⚠️ 删除失败。`
+        );
+        break;
+      }
+
       case 'sync_commands': {
         await sendMessage(token, chatId, '🔄 正在同步 Telegram 机器人命令菜单...');
         await syncTelegramCommands(env);
@@ -766,6 +1465,28 @@ export default {
 
   async scheduled(event, env, ctx) {
     logInfo('scheduled.triggered', { cron: event.cron });
-    ctx.waitUntil(refreshAllCaches(env, { source: 'cron', allowHttpFallback: true }));
+
+    const now = new Date();
+    const minute = now.getUTCMinutes();
+    const promises = [];
+
+    // 1. Instagram refresh runs every 10 minutes (minutes ending in 0)
+    if (minute % 10 === 0) {
+      promises.push(refreshAllCaches(env, { source: 'cron', allowHttpFallback: true }));
+    }
+
+    // 2. RSS processing runs every 5 minutes (every trigger)
+    const { processDueSubscriptions } = await import('./rss/scheduler.js');
+    promises.push(processDueSubscriptions(env.DB, env, { batchLimit: 5 }));
+
+    // 3. Notification sending runs every 5 minutes (every trigger)
+    const { processNotificationBatch } = await import('./notifications/sender.js');
+    promises.push(processNotificationBatch(env.DB, env, { batchLimit: 10 }));
+
+    // 4. Stock rules evaluation runs every 5 minutes (every trigger)
+    const { evaluateRules } = await import('./trackers/engine.js');
+    promises.push(evaluateRules(env.DB, env).catch(err => console.error('[scheduled] evaluateRules error:', err.message)));
+
+    ctx.waitUntil(Promise.all(promises));
   }
 };

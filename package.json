@@ -8,12 +8,15 @@
     "dev:remote": "wrangler dev --remote",
     "check": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "vitest run"
   },
   "dependencies": {
-    "hono": "^4.4.0"
+    "fast-xml-parser": "^5.10.0",
+    "hono": "^4.12.30"
   },
   "devDependencies": {
+    "vitest": "^4.1.10",
     "wrangler": "^4.76.0"
   }
 }

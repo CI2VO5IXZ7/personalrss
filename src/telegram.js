@@ -2,8 +2,18 @@
 
 import { escapeHtml } from './html.js';
 import { logError } from './log.js';
+import { redactUrl, redactText } from './security/url.js';
 
 const TG_API = 'https://api.telegram.org/bot';
+
+export class TelegramError extends Error {
+  constructor(message, status, retryAfter = null) {
+    super(message);
+    this.name = 'TelegramError';
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
 
 async function parseTelegramResponse(resp, action) {
   let data = null;
@@ -11,7 +21,7 @@ async function parseTelegramResponse(resp, action) {
     data = await resp.json();
   } catch {
     logError('telegram.response_parse_failed', { action, status: resp.status });
-    throw new Error(`Telegram ${action} returned a non-JSON response`);
+    throw new TelegramError(`Telegram ${action} returned a non-JSON response`, resp.status);
   }
 
   if (!resp.ok || !data?.ok) {
@@ -21,14 +31,25 @@ async function parseTelegramResponse(resp, action) {
       status: resp.status,
       description
     });
-    throw new Error(description);
+    const retryAfter = data?.parameters?.retry_after || null;
+    throw new TelegramError(description, resp.status, retryAfter);
   }
 
   return data;
 }
 
-export async function sendMessage(token, chatId, text, parseMode = 'HTML') {
-  const resp = await fetch(`${TG_API}${token}/sendMessage`, {
+export async function sendMessage(token, chatId, text, parseModeOrOptions = 'HTML', options = {}) {
+  let parseMode = 'HTML';
+  let opts = {};
+  if (typeof parseModeOrOptions === 'object' && parseModeOrOptions !== null) {
+    opts = parseModeOrOptions;
+    parseMode = opts.parseMode || 'HTML';
+  } else {
+    parseMode = parseModeOrOptions;
+    opts = options || {};
+  }
+  const fetchFn = opts.fetchFn || fetch;
+  const resp = await fetchFn(`${TG_API}${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -41,7 +62,34 @@ export async function sendMessage(token, chatId, text, parseMode = 'HTML') {
   return parseTelegramResponse(resp, 'sendMessage');
 }
 
-export async function sendPhoto(token, chatId, photoBytes, caption = '') {
+export async function sendPhotoWithFallback(token, chatId, photoUrl, caption = '', options = {}) {
+  const fetchFn = options?.fetchFn || fetch;
+  if (!photoUrl) {
+    return sendMessage(token, chatId, caption, 'HTML', options);
+  }
+  try {
+    const resp = await fetchFn(`${TG_API}${token}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: photoUrl,
+        caption: caption,
+        parse_mode: 'HTML'
+      })
+    });
+    return await parseTelegramResponse(resp, 'sendPhoto');
+  } catch (err) {
+    if (err instanceof TelegramError && err.status === 429) {
+      throw err;
+    }
+    console.warn(`[telegram] sendPhoto failed for ${redactUrl(photoUrl)}, falling back to sendMessage:`, redactText(err.message));
+    return sendMessage(token, chatId, caption, 'HTML', options);
+  }
+}
+
+export async function sendPhoto(token, chatId, photoBytes, caption = '', options = {}) {
+  const fetchFn = options?.fetchFn || fetch;
   const form = new FormData();
   form.append('chat_id', String(chatId));
   form.append('photo', new Blob([photoBytes], { type: 'image/png' }), 'qr.png');
@@ -49,17 +97,27 @@ export async function sendPhoto(token, chatId, photoBytes, caption = '') {
     form.append('caption', caption);
     form.append('parse_mode', 'HTML');
   }
-  const resp = await fetch(`${TG_API}${token}/sendPhoto`, {
+  const resp = await fetchFn(`${TG_API}${token}/sendPhoto`, {
     method: 'POST',
     body: form
   });
   return parseTelegramResponse(resp, 'sendPhoto');
 }
 
-export async function setWebhook(token, url, secretToken = '') {
+export async function setWebhook(token, url, secretTokenOrOptions = '', options = {}) {
+  let secretToken = '';
+  let opts = {};
+  if (typeof secretTokenOrOptions === 'object' && secretTokenOrOptions !== null) {
+    opts = secretTokenOrOptions;
+    secretToken = opts.secretToken || '';
+  } else {
+    secretToken = secretTokenOrOptions;
+    opts = options || {};
+  }
+  const fetchFn = opts.fetchFn || fetch;
   const body = { url };
   if (secretToken) body.secret_token = secretToken;
-  const resp = await fetch(`${TG_API}${token}/setWebhook`, {
+  const resp = await fetchFn(`${TG_API}${token}/setWebhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
@@ -67,8 +125,9 @@ export async function setWebhook(token, url, secretToken = '') {
   return parseTelegramResponse(resp, 'setWebhook');
 }
 
-export async function setMyCommands(token, commands) {
-  const resp = await fetch(`${TG_API}${token}/setMyCommands`, {
+export async function setMyCommands(token, commands, options = {}) {
+  const fetchFn = options?.fetchFn || fetch;
+  const resp = await fetchFn(`${TG_API}${token}/setMyCommands`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ commands })
