@@ -47,7 +47,7 @@ head_sampling_rate = 1
 # Secrets & Configs (通过 wrangler secret put 设置，不进代码仓库):
 # TELEGRAM_BOT_TOKEN       - 管理 Bot Token
 # TELEGRAM_CHAT_ID         - 管理接收消息/命令的 Chat ID
-# TELEGRAM_ADMIN_USER_ID   - (可选) 管理员的个人 User ID，配置后限制其他用户在同一 chat 中执行命令
+# TELEGRAM_ADMIN_USER_ID   - 管理员的个人 User ID，用于限制其他用户在同一 chat 中执行命令
 # ADMIN_TOKEN              - 管理接口鉴权 Token / Webhook secret
 # PUSH_TELEGRAM_BOT_TOKEN  - 新建推送 Bot Token，专用于内容私人频道推送
 # PUSH_TELEGRAM_CHANNEL_ID - 内容推送私人频道 ID (e.g. -100xxx)
