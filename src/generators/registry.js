@@ -1,6 +1,7 @@
 // Generator Provider 静态注册表
 
 import { validateGeneratorProvider, GENERATOR_PROVIDER_TYPE_PATTERN } from './core/contract.js';
+import { instagramProvider } from './providers/instagram/index.js';
 
 function normalizeType(type) {
   if (typeof type !== 'string') {
@@ -60,6 +61,6 @@ export class GeneratorRegistry {
   }
 }
 
-export function createGeneratorRegistry(providers) {
+export function createGeneratorRegistry(providers = [instagramProvider]) {
   return new GeneratorRegistry(providers);
 }

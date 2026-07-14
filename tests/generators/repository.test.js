@@ -491,4 +491,107 @@ describe('Generator Repository', () => {
       expect(remaining).toHaveLength(0);
     });
   });
+
+  describe('updateRefreshState atomic updates and validations', () => {
+    it('atomically updates nextRefreshAt and status with validation', async () => {
+      const inst = await repo.createInstance(db, { providerType: 'ig', instanceKey: 'atomic_test' });
+
+      // Initially nextRefreshAt is null, status is active and empty status row
+      const initialStatus = await repo.getStatus(db, inst.id);
+      expect(initialStatus.lastResult).toBe('');
+
+      const nextTime = new Date('2026-07-14T05:00:00Z');
+      const updated = await repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: nextTime,
+        statusUpdates: {
+          lastResult: 'success',
+          consecutiveFailures: 0,
+          lastItemCount: 5,
+          lastNewCount: 2,
+          lastDurationMs: 120
+        }
+      });
+      expect(updated).toBe(true);
+
+      const retrieved = await repo.getInstance(db, inst.id);
+      expect(retrieved.nextRefreshAt).toBe('2026-07-14T05:00:00.000Z');
+
+      const status = await repo.getStatus(db, inst.id);
+      expect(status.lastResult).toBe('success');
+      expect(status.consecutiveFailures).toBe(0);
+      expect(status.lastItemCount).toBe(5);
+      expect(status.lastNewCount).toBe(2);
+      expect(status.lastDurationMs).toBe(120);
+    });
+
+    it('rejects invalid status fields in updateRefreshState', async () => {
+      const inst = await repo.createInstance(db, { providerType: 'ig', instanceKey: 'atomic_val_test' });
+      await expect(repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: null,
+        statusUpdates: {
+          invalidField: 'val'
+        }
+      })).rejects.toThrow('Invalid status field: invalidField');
+    });
+
+    it('rejects invalid status values in updateRefreshState', async () => {
+      const inst = await repo.createInstance(db, { providerType: 'ig', instanceKey: 'atomic_val_test2' });
+
+      // Invalid lastResult value
+      await expect(repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: null,
+        statusUpdates: {
+          lastResult: 'not-a-valid-result'
+        }
+      })).rejects.toThrow('Invalid lastResult value');
+
+      // Invalid numeric field
+      await expect(repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: null,
+        statusUpdates: {
+          consecutiveFailures: 'three'
+        }
+      })).rejects.toThrow('Invalid numeric value');
+
+      await expect(repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: null,
+        statusUpdates: {
+          consecutiveFailures: -1
+        }
+      })).rejects.toThrow('Invalid numeric value');
+    });
+
+    it('rolls back nextRefreshAt update if status update fails', async () => {
+      const inst = await repo.createInstance(db, { providerType: 'ig', instanceKey: 'atomic_rollback' });
+      expect(inst.nextRefreshAt).toBeNull();
+
+      const originalPrepare = db.prepare;
+      db.prepare = function (sql) {
+        if (sql.includes('UPDATE generator_status')) {
+          return {
+            bind: () => ({
+              run: async () => {
+                throw new Error('Simulated status table update failure');
+              }
+            })
+          };
+        }
+        return originalPrepare.call(db, sql);
+      };
+
+      const nextTime = new Date('2026-07-14T06:00:00Z');
+      await expect(repo.updateRefreshState(db, inst.id, {
+        nextRefreshAt: nextTime,
+        statusUpdates: {
+          lastResult: 'success'
+        }
+      })).rejects.toThrow('Simulated status table update failure');
+
+      db.prepare = originalPrepare;
+
+      // Verify that nextRefreshAt was rolled back to null (not updated to nextTime)
+      const retrieved = await repo.getInstance(db, inst.id);
+      expect(retrieved.nextRefreshAt).toBeNull();
+    });
+  });
 });

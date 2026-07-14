@@ -305,6 +305,97 @@ export async function updateStatus(db, generatorId, updates = {}) {
   return result.meta.changes > 0;
 }
 
+export async function updateRefreshState(db, id, { nextRefreshAt, statusUpdates }) {
+  if (typeof db.batch !== 'function') {
+    throw new Error('Database batch operation is not supported');
+  }
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error('Invalid generator ID');
+  }
+
+  const allowedFields = {
+    lastAttemptAt: 'last_attempt_at',
+    lastSuccessAt: 'last_success_at',
+    lastResult: 'last_result',
+    lastError: 'last_error',
+    consecutiveFailures: 'consecutive_failures',
+    lastItemCount: 'last_item_count',
+    lastNewCount: 'last_new_count',
+    lastDurationMs: 'last_duration_ms',
+    lastAlertedFailureCount: 'last_alerted_failure_count'
+  };
+
+  const statusFields = [];
+  const statusParams = [];
+
+  for (const [key, val] of Object.entries(statusUpdates || {})) {
+    if (!Object.hasOwn(allowedFields, key)) {
+      throw new Error(`Invalid status field: ${key}`);
+    }
+    const colName = allowedFields[key];
+    statusFields.push(`${colName} = ?`);
+    let boundVal = val;
+    if (boundVal instanceof Date) {
+      if (isNaN(boundVal.getTime())) {
+        throw new Error(`Invalid Date object for field ${key}`);
+      }
+      boundVal = boundVal.toISOString();
+    }
+
+    // Value validation
+    if (key === 'lastResult') {
+      if (boundVal !== 'success' && boundVal !== 'failed' && boundVal !== 'empty' && boundVal !== 'error') {
+        throw new Error(`Invalid lastResult value: ${boundVal}`);
+      }
+    }
+    if (key === 'consecutiveFailures' || key === 'lastItemCount' || key === 'lastNewCount' || key === 'lastDurationMs' || key === 'lastAlertedFailureCount') {
+      if (boundVal !== null && boundVal !== undefined && (!Number.isInteger(boundVal) || boundVal < 0)) {
+        throw new Error(`Invalid numeric value for field ${key}: ${boundVal}`);
+      }
+    }
+    if (key === 'lastAttemptAt' || key === 'lastSuccessAt') {
+      if (boundVal !== null && boundVal !== undefined && typeof boundVal === 'string') {
+        const parsed = new Date(boundVal);
+        if (isNaN(parsed.getTime())) {
+          throw new Error(`Invalid date string for field ${key}: ${boundVal}`);
+        }
+      }
+    }
+    statusParams.push(boundVal);
+  }
+
+  statusFields.push("updated_at = datetime('now')");
+  statusParams.push(id);
+  const statusSql = `UPDATE generator_status SET ${statusFields.join(', ')} WHERE generator_id = ?`;
+
+  let nextRefreshAtStr = null;
+  if (nextRefreshAt instanceof Date) {
+    if (isNaN(nextRefreshAt.getTime())) {
+      throw new Error('Invalid nextRefreshAt Date');
+    }
+    nextRefreshAtStr = nextRefreshAt.toISOString();
+  } else if (typeof nextRefreshAt === 'string') {
+    const parsed = new Date(nextRefreshAt);
+    if (isNaN(parsed.getTime())) {
+      throw new Error('Invalid nextRefreshAt date string');
+    }
+    nextRefreshAtStr = nextRefreshAt;
+  } else if (nextRefreshAt !== null && nextRefreshAt !== undefined) {
+    throw new Error('Invalid nextRefreshAt value type');
+  }
+
+  const statements = [
+    db.prepare(
+      `UPDATE generator_instances SET next_refresh_at = ?, updated_at = datetime('now') WHERE id = ?`
+    ).bind(nextRefreshAtStr, id),
+    db.prepare(statusSql).bind(...statusParams)
+  ];
+
+  const results = await db.batch(statements);
+  return results[0].meta.changes > 0;
+}
+
+
 export async function saveItem(db, generatorId, item) {
   if (!Number.isInteger(generatorId) || generatorId <= 0) {
     throw new Error('Invalid generator ID');

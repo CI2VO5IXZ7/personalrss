@@ -7,6 +7,7 @@ import {
   GENERATOR_PROVIDER_TYPE_PATTERN
 } from '../../src/generators/core/contract.js';
 import { createGeneratorRegistry } from '../../src/generators/registry.js';
+import { instagramProvider } from '../../src/generators/providers/instagram/index.js';
 
 function createMockProvider(overrides = {}) {
   return {
@@ -295,5 +296,33 @@ describe('Generator Registry', () => {
 
     const registry = createGeneratorRegistry();
     expect(() => registry.register(new MockProvider())).toThrow(/own|method|prototype/);
+  });
+});
+
+describe('Default Instagram Provider Registry', () => {
+  it('includes the Instagram provider by default', () => {
+    const registry = createGeneratorRegistry();
+    expect(registry.has('instagram')).toBe(true);
+    expect(registry.get('instagram')).toBeDefined();
+    expect(registry.get('Instagram')).toBe(registry.get('instagram'));
+    expect(registry.types()).toContain('instagram');
+  });
+
+  it('allows explicit injection to isolate tests from the default set', () => {
+    const registry = createGeneratorRegistry([]);
+    expect(registry.has('instagram')).toBe(false);
+    expect(registry.list()).toHaveLength(0);
+  });
+
+  it('can be created with a custom provider alongside the default Instagram provider', () => {
+    const mock = createMockProvider({ type: 'mock', displayName: 'Mock' });
+    const registry = createGeneratorRegistry([mock]);
+    expect(registry.has('mock')).toBe(true);
+    expect(registry.has('instagram')).toBe(false);
+    expect(registry.types()).toEqual(['mock']);
+  });
+
+  it('validates the default Instagram provider against the contract', () => {
+    expect(validateGeneratorProvider(instagramProvider)).toBe(instagramProvider);
   });
 });
