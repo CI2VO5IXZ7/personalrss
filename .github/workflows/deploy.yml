@@ -117,6 +117,7 @@ jobs:
             process.stderr.write(`${JSON.stringify({ stage: 'getMe', status, message: 'Management Telegram bot validation failed' })}\n`);
             process.exit(1);
           }
+          process.stdout.write(`${JSON.stringify({ stage: 'getMe', botId: payload.result.id, username: payload.result.username || null })}\n`);
           NODE
 
       - name: Setup Telegram Webhook
@@ -235,6 +236,7 @@ jobs:
             process.stderr.write(`${JSON.stringify({ stage: 'getWebhookInfo', status, message: 'Telegram webhook URL verification failed' })}\n`);
             process.exit(1);
           }
+          process.stdout.write(`${JSON.stringify({ stage: 'getWebhookInfo', webhookHost: new URL(actual).host, webhookPath: new URL(actual).pathname })}\n`);
           NODE
 
       - name: Verify Push Telegram Delivery
