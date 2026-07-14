@@ -1,9 +1,25 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   TelegramError,
+  deriveWebhookSecret,
   sendMessage,
   sendPhotoWithFallback
 } from '../src/telegram.js';
+
+const punctuationHeavyAdminToken = 'Adm!n:T0ken/with?punctuation&symbols=%23+[]{}';
+
+describe('deriveWebhookSecret', () => {
+  it('derives a deterministic Telegram-safe lowercase SHA-256 hex secret', async () => {
+    const secret = await deriveWebhookSecret(punctuationHeavyAdminToken);
+
+    expect(secret).toBe('050ad2e7e1fa7c92b5290906ec621798a4f516510086ee27d7fc573e78420474');
+    expect(secret).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('fails closed when ADMIN_TOKEN is empty', async () => {
+    await expect(deriveWebhookSecret('')).rejects.toThrow('ADMIN_TOKEN is required');
+  });
+});
 
 describe('Telegram Push Helpers', () => {
   it('should send a text message successfully', async () => {

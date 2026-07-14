@@ -63,7 +63,8 @@ describe('manual deployment workflow', () => {
     expect(sync).toMatch(/node[\s\S]*\|\s*npx wrangler secret bulk(?:\s|$)/);
     expect(sync).not.toMatch(/(?:>|tee\b).*secret/i);
     expect(workflow.indexOf('- name: Deploy')).toBeLessThan(workflow.indexOf('Sync Worker Secrets'));
-    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('Setup Telegram Webhook'));
+    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('Validate Management Telegram Bot'));
+    expect(workflow.indexOf('Validate Management Telegram Bot')).toBeLessThan(workflow.indexOf('Setup Telegram Webhook'));
     expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('Verify Push Telegram Delivery'));
     expect(workflow.indexOf('Setup Telegram Webhook')).toBeLessThan(workflow.indexOf('Verify Push Telegram Delivery'));
   });
@@ -85,6 +86,17 @@ describe('manual deployment workflow', () => {
     expect(deploy).toContain('npx wrangler deploy');
     expect(workflow.indexOf('Apply D1 Migrations')).toBeLessThan(deployPosition);
     expect(deployPosition).toBeLessThan(workflow.indexOf('Sync Worker Secrets'));
+  });
+
+  it('preflights the management bot with getMe without printing its token or response body', () => {
+    const preflight = stepBody('Validate Management Telegram Bot');
+
+    expect(preflight).toContain('set -euo pipefail');
+    expect(preflight).toContain('bot${TELEGRAM_BOT_TOKEN}/getMe');
+    expect(preflight).toContain('--output "$response_file"');
+    expect(preflight).toMatch(/payload\.ok[\s\S]*payload\.result\?\.id/);
+    expect(preflight).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+    expect(preflight).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*TELEGRAM_BOT_TOKEN/m);
   });
 
   it('safely parses BASE_URL and authenticates the webhook POST', () => {
@@ -114,6 +126,10 @@ describe('manual deployment workflow', () => {
     expect(webhook).toMatch(/attempt\s*==\s*max_attempts[\s\S]*exit 1/);
     expect(webhook).toContain('sleep "$retry_delay_seconds"');
     expect(webhook.indexOf('for (( attempt=1')).toBeLessThan(webhook.indexOf('WEBHOOK_RESPONSE_FILE='));
+    expect(webhook).toMatch(/attempt\s*==\s*max_attempts[\s\S]*print_safe_setup_failure/);
+    expect(webhook).toContain('const diagnostic = { stage, status, message };');
+    expect(webhook).toContain('process.stderr.write(`${JSON.stringify(diagnostic)}\\n`);');
+    expect(webhook).not.toMatch(/JSON\.stringify\(payload\)/);
   });
 
   it('performs a failing-fast real push delivery smoke test without logging secrets', () => {

@@ -9,11 +9,12 @@ import {
   setFailureAlertCount
 } from './db.js';
 import { generateInstagramFeed } from './rss.js';
-import { sendMessage, setWebhook, setMyCommands, parseCommand, verifyWebhookSecret, escapeHtml } from './telegram.js';
+import { sendMessage, setWebhook, setMyCommands, parseCommand, verifyWebhookSecret, deriveWebhookSecret, escapeHtml } from './telegram.js';
 import { buildTelegramHelpMessage, getTelegramBotCommands } from './telegram_commands.js';
 import { handleImageProxy, handleMediaProxy } from './proxy.js';
 import { fetchProfile as fetchIg, validateProfile as validateIg, probeProfile as probeIg } from './crawlers/instagram.js';
 import { logError, logInfo, logWarn } from './log.js';
+import { redactText } from './security/url.js';
 
 const app = new Hono();
 
@@ -410,6 +411,24 @@ async function syncTelegramCommands(env) {
   return result;
 }
 
+function safeTelegramSetupFailure(c, stage, error) {
+  let message = redactText(error?.message || 'Telegram request failed');
+  for (const secret of [c.env.ADMIN_TOKEN, c.env.TELEGRAM_BOT_TOKEN]) {
+    if (typeof secret === 'string' && secret) {
+      message = message.split(secret).join('***');
+    }
+  }
+
+  const failure = {
+    ok: false,
+    stage,
+    status: Number.isInteger(error?.status) ? error.status : null,
+    message: truncate(message, 300)
+  };
+  logError('telegram.setup_failed', failure);
+  return c.json(failure, 502);
+}
+
 // ─── Closed Public Pages ──────────────────────────────────────────────────────
 
 app.get('/', c => c.text('Not Found', 404));
@@ -452,9 +471,21 @@ app.post('/setup-webhook', async c => {
   if (unauthorized) return unauthorized;
 
   const baseUrl = getBaseUrl(c.env, c.req.raw);
-  const secretToken = c.env.ADMIN_TOKEN || '';
-  const webhook = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
-  const commands = await syncTelegramCommands(c.env);
+  let webhook;
+  try {
+    const secretToken = await deriveWebhookSecret(c.env.ADMIN_TOKEN);
+    webhook = await setWebhook(c.env.TELEGRAM_BOT_TOKEN, `${baseUrl}/telegram`, secretToken);
+  } catch (error) {
+    return safeTelegramSetupFailure(c, 'setWebhook', error);
+  }
+
+  let commands;
+  try {
+    commands = await syncTelegramCommands(c.env);
+  } catch (error) {
+    return safeTelegramSetupFailure(c, 'setMyCommands', error);
+  }
+
   return c.json({ webhook, commands });
 });
 
@@ -615,7 +646,15 @@ app.get('/admin/probe-stock', async c => {
 // ─── Telegram Webhook ─────────────────────────────────────────────────────────
 
 app.post('/telegram', async c => {
-  if (!verifyWebhookSecret(c.req.raw, c.env.ADMIN_TOKEN || '')) {
+  let expectedWebhookSecret;
+  try {
+    expectedWebhookSecret = await deriveWebhookSecret(c.env.ADMIN_TOKEN);
+  } catch {
+    logError('telegram.webhook_secret_unavailable', {});
+    return c.text('ok');
+  }
+
+  if (!verifyWebhookSecret(c.req.raw, expectedWebhookSecret)) {
     logWarn('telegram.webhook_secret_rejected', {});
     return c.text('ok');
   }

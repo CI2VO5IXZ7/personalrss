@@ -88,6 +88,37 @@ jobs:
           process.stdout.write(JSON.stringify(values));
           NODE
 
+      - name: Validate Management Telegram Bot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          if ! http_status="$(
+            curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe"
+          )"; then
+            printf '{"stage":"getMe","status":null,"message":"Telegram getMe transport request failed"}\n' >&2
+            exit 1
+          fi
+
+          TELEGRAM_RESPONSE_FILE="$response_file" HTTP_STATUS="$http_status" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          let payload = null;
+          try {
+            payload = JSON.parse(fs.readFileSync(process.env.TELEGRAM_RESPONSE_FILE, 'utf8'));
+          } catch {}
+          if (!/^2\d\d$/.test(process.env.HTTP_STATUS) || !payload || payload.ok !== true || !payload.result?.id) {
+            const status = Number(process.env.HTTP_STATUS) || null;
+            process.stderr.write(`${JSON.stringify({ stage: 'getMe', status, message: 'Management Telegram bot validation failed' })}\n`);
+            process.exit(1);
+          }
+          NODE
+
       - name: Setup Telegram Webhook
         shell: bash
         run: |
@@ -112,6 +143,32 @@ jobs:
           max_attempts=10
           retry_delay_seconds=3
 
+          print_safe_setup_failure() {
+            HTTP_STATUS="$1" node --input-type=module - "$response_file" <<'NODE'
+          import fs from 'node:fs';
+
+          let payload = null;
+          try {
+            payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          } catch {}
+
+          const allowedStages = new Set(['setWebhook', 'setMyCommands']);
+          const hasSafePayload = process.env.HTTP_STATUS !== '0' && payload?.ok === false && allowedStages.has(payload.stage);
+          const stage = hasSafePayload ? payload.stage : 'setup-webhook';
+          const telegramStatus = hasSafePayload && Number.isInteger(payload.status) ? payload.status : null;
+          const httpStatus = Number(process.env.HTTP_STATUS) || null;
+          const status = telegramStatus ?? httpStatus;
+          let message = hasSafePayload && typeof payload.message === 'string'
+            ? payload.message.slice(0, 300)
+            : 'Telegram webhook setup failed';
+          for (const secret of [process.env.ADMIN_TOKEN, process.env.TELEGRAM_BOT_TOKEN]) {
+            if (secret) message = message.split(secret).join('***');
+          }
+          const diagnostic = { stage, status, message };
+          process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+          NODE
+          }
+
           for (( attempt=1; attempt<=max_attempts; attempt++ )); do
             if ! http_status="$(
               curl --silent --show-error \
@@ -121,7 +178,7 @@ jobs:
                 --header "Authorization: Bearer ${ADMIN_TOKEN}" \
                 "${BASE_URL}/setup-webhook"
             )"; then
-              printf 'Webhook setup request failed due to a transport error.\n' >&2
+              print_safe_setup_failure "0"
               exit 1
             fi
 
@@ -131,8 +188,7 @@ jobs:
 
             if [[ "$http_status" == "401" || "$http_status" =~ ^5[0-9][0-9]$ ]]; then
               if (( attempt == max_attempts )); then
-                printf 'Webhook setup failed after %d attempts (last HTTP status %s).\n' \
-                  "$max_attempts" "$http_status" >&2
+                print_safe_setup_failure "$http_status"
                 exit 1
               fi
               printf 'Webhook setup returned retryable HTTP status %s; retrying (%d/%d).\n' \

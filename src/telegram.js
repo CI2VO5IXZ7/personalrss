@@ -6,6 +6,15 @@ import { redactUrl, redactText } from './security/url.js';
 
 const TG_API = 'https://api.telegram.org/bot';
 
+export async function deriveWebhookSecret(adminToken) {
+  if (typeof adminToken !== 'string' || adminToken.length === 0) {
+    throw new Error('ADMIN_TOKEN is required to derive the Telegram webhook secret');
+  }
+
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(adminToken));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 export class TelegramError extends Error {
   constructor(message, status, retryAfter = null) {
     super(message);
@@ -28,8 +37,7 @@ async function parseTelegramResponse(resp, action) {
     const description = data?.description || `Telegram ${action} HTTP ${resp.status}`;
     logError('telegram.request_failed', {
       action,
-      status: resp.status,
-      description
+      status: resp.status
     });
     const retryAfter = data?.parameters?.retry_after || null;
     throw new TelegramError(description, resp.status, retryAfter);

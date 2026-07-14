@@ -36,7 +36,7 @@ describe('Telegram Bot Stock Commands', () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Telegram-Bot-Api-Secret-Token': 'secret-token'
+        'X-Telegram-Bot-Api-Secret-Token': '930bbdc51b6aed5c2a5678fd6e28dee7a05e8a4b643cfc0b4427c3efb86c0d94'
       },
       body: JSON.stringify(payload)
     });
