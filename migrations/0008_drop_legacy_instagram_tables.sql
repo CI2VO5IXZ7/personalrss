@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS accounts;
+DROP TABLE IF EXISTS posts_cache;
+DROP TABLE IF EXISTS crawl_status;
+DROP TABLE IF EXISTS api_usage;

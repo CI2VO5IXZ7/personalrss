@@ -518,3 +518,395 @@ export function rowToPost(row) {
     raw_images: safeParseJson(row.raw_images, [])
   };
 }
+
+// ─── RSS Subscriptions ────────────────────────────────────────────────────────
+
+export async function addRssSubscription(db, feedUrl, feedUrlRedacted, siteUrl, title, intervalMinutes = 10) {
+  try {
+    const result = await db.prepare(
+      `INSERT OR IGNORE INTO rss_subscriptions (feed_url, feed_url_redacted, site_url, title, interval_minutes, next_check_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).bind(feedUrl, feedUrlRedacted, siteUrl, title, intervalMinutes).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] addRssSubscription error:', e.message);
+    return false;
+  }
+}
+
+export async function getRssSubscriptions(db) {
+  try {
+    const { results } = await db.prepare('SELECT * FROM rss_subscriptions ORDER BY created_at DESC').all();
+    return results || [];
+  } catch (e) {
+    console.error('[db] getRssSubscriptions error:', e.message);
+    return [];
+  }
+}
+
+export async function getRssSubscription(db, id) {
+  try {
+    return await db.prepare('SELECT * FROM rss_subscriptions WHERE id = ?').bind(id).first();
+  } catch (e) {
+    console.error('[db] getRssSubscription error:', e.message);
+    return null;
+  }
+}
+
+export async function getRssSubscriptionByUrl(db, feedUrl) {
+  try {
+    return await db.prepare('SELECT * FROM rss_subscriptions WHERE feed_url = ?').bind(feedUrl).first();
+  } catch (e) {
+    console.error('[db] getRssSubscriptionByUrl error:', e.message);
+    return null;
+  }
+}
+
+export async function removeRssSubscription(db, id) {
+  try {
+    await db.prepare('DELETE FROM rss_entries WHERE subscription_id = ?').bind(id).run();
+    const result = await db.prepare('DELETE FROM rss_subscriptions WHERE id = ?').bind(id).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] removeRssSubscription error:', e.message);
+    return false;
+  }
+}
+
+export async function pauseRssSubscription(db, id) {
+  try {
+    const result = await db.prepare("UPDATE rss_subscriptions SET status = 'paused', updated_at = datetime('now') WHERE id = ?")
+      .bind(id).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] pauseRssSubscription error:', e.message);
+    return false;
+  }
+}
+
+export async function resumeRssSubscription(db, id) {
+  try {
+    const result = await db.prepare("UPDATE rss_subscriptions SET status = 'active', next_check_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+      .bind(id).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] resumeRssSubscription error:', e.message);
+    return false;
+  }
+}
+
+export async function updateRssSubscriptionInterval(db, id, intervalMinutes) {
+  try {
+    const result = await db.prepare("UPDATE rss_subscriptions SET interval_minutes = ?, updated_at = datetime('now') WHERE id = ?")
+      .bind(intervalMinutes, id).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] updateRssSubscriptionInterval error:', e.message);
+    return false;
+  }
+}
+
+export async function updateRssSubscriptionCheck(db, id, fields = {}) {
+  try {
+    const query = `
+      UPDATE rss_subscriptions
+      SET status = ?,
+          etag = ?,
+          last_modified = ?,
+          last_checked_at = ?,
+          last_success_at = ?,
+          consecutive_failures = ?,
+          last_error = ?,
+          next_check_at = ?,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `;
+    const result = await db.prepare(query).bind(
+      fields.status || 'active',
+      fields.etag || '',
+      fields.lastModified || '',
+      fields.lastCheckedAt || '',
+      fields.lastSuccessAt || '',
+      fields.consecutiveFailures || 0,
+      fields.lastError || '',
+      fields.nextCheckAt || '',
+      id
+    ).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] updateRssSubscriptionCheck error:', e.message);
+    return false;
+  }
+}
+
+export async function getDueRssSubscriptions(db, limit = 10) {
+  try {
+    const { results } = await db.prepare(
+      `SELECT * FROM rss_subscriptions
+       WHERE status = 'active' AND (next_check_at IS NULL OR next_check_at <= datetime('now'))
+       ORDER BY next_check_at ASC
+       LIMIT ?`
+    ).bind(limit).all();
+    return results || [];
+  } catch (e) {
+    console.error('[db] getDueRssSubscriptions error:', e.message);
+    return [];
+  }
+}
+
+// ─── RSS Entries ──────────────────────────────────────────────────────────────
+
+export async function hasRssEntry(db, subscriptionId, entryKey, link = '', contentHash = '') {
+  try {
+    const row = await db.prepare(
+      `SELECT id FROM rss_entries
+       WHERE subscription_id = ? AND (
+         entry_key = ?
+         OR (? <> '' AND link = ?)
+         OR (? <> '' AND content_hash = ?)
+       )`
+    ).bind(subscriptionId, entryKey, link, link, contentHash, contentHash).first();
+    return !!row;
+  } catch (e) {
+    console.error('[db] hasRssEntry error:', e.message);
+    return false;
+  }
+}
+
+export async function addRssEntry(db, subscriptionId, entry) {
+  try {
+    const result = await db.prepare(
+      `INSERT OR IGNORE INTO rss_entries (subscription_id, entry_key, guid, link, title, published_at, content_hash, image_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      subscriptionId,
+      entry.entryKey,
+      entry.guid || '',
+      entry.link || '',
+      entry.title || '',
+      entry.publishedAt || '',
+      entry.contentHash || '',
+      entry.imageUrl || ''
+    ).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] addRssEntry error:', e.message);
+    return false;
+  }
+}
+
+export async function atomicClaimAndEnqueueRssNotification(db, subscriptionId, entry, payload) {
+  const link = entry.link || '';
+  const contentHash = entry.contentHash || '';
+  const payloadJson = typeof payload === 'object' ? JSON.stringify(payload) : payload;
+  const results = await db.batch([
+    db.prepare(
+      `INSERT INTO rss_entries
+         (subscription_id, entry_key, guid, link, title, published_at, content_hash, image_url)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM rss_entries
+         WHERE subscription_id = ? AND (
+           entry_key = ?
+           OR (? <> '' AND link = ?)
+           OR (? <> '' AND content_hash = ?)
+         )
+       )`
+    ).bind(
+      subscriptionId,
+      entry.entryKey,
+      entry.guid || '',
+      link,
+      entry.title || '',
+      entry.publishedAt || '',
+      contentHash,
+      entry.imageUrl || '',
+      subscriptionId,
+      entry.entryKey,
+      link,
+      link,
+      contentHash,
+      contentHash
+    ),
+    db.prepare(
+      `INSERT INTO notification_queue (kind, dedupe_key, payload_json, status, available_at)
+       SELECT 'rss', ?, ?, 'pending', ?
+       WHERE changes() > 0`
+    ).bind(`rss:${subscriptionId}:${entry.entryKey}`, payloadJson, new Date().toISOString())
+  ]);
+  return (results[0]?.meta?.changes || 0) > 0;
+}
+
+// ─── Bot Sessions ────────────────────────────────────────────────────────────
+
+export async function getBotSession(db, chatId) {
+  try {
+    const row = await db.prepare('SELECT * FROM bot_sessions WHERE chat_id = ?').bind(String(chatId)).first();
+    if (!row) return null;
+
+    // Check expiration
+    if (row.expires_at && new Date(row.expires_at) < new Date()) {
+      await clearBotSession(db, chatId);
+      return null;
+    }
+    return row;
+  } catch (e) {
+    console.error('[db] getBotSession error:', e.message);
+    return null;
+  }
+}
+
+export async function setBotSession(db, chatId, flow, step, data, expiresAt) {
+  try {
+    const dataJson = typeof data === 'object' ? JSON.stringify(data) : data;
+    const result = await db.prepare(
+      `INSERT OR REPLACE INTO bot_sessions (chat_id, flow, step, data_json, expires_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).bind(String(chatId), flow, step, dataJson, expiresAt || null).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] setBotSession error:', e.message);
+    return false;
+  }
+}
+
+export async function clearBotSession(db, chatId) {
+  try {
+    const result = await db.prepare('DELETE FROM bot_sessions WHERE chat_id = ?').bind(String(chatId)).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] clearBotSession error:', e.message);
+    return false;
+  }
+}
+
+// ─── Tracker Rules & Events ──────────────────────────────────────────────────
+
+export async function addTrackerRule(db, { providerType, targetKey, targetConfig, conditionType, conditionValue, status = 'active' }) {
+  try {
+    const targetConfigJson = typeof targetConfig === 'object' ? JSON.stringify(targetConfig) : targetConfig;
+    const result = await db.prepare(
+      `INSERT INTO tracker_rules (provider_type, target_key, target_config_json, condition_type, condition_value, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
+    ).bind(providerType, targetKey, targetConfigJson, conditionType, conditionValue, status).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] addTrackerRule error:', e.message);
+    return false;
+  }
+}
+
+export async function getTrackerRules(db) {
+  try {
+    const { results } = await db.prepare('SELECT * FROM tracker_rules ORDER BY created_at DESC').all();
+    return results || [];
+  } catch (e) {
+    console.error('[db] getTrackerRules error:', e.message);
+    return [];
+  }
+}
+
+export async function getTrackerRule(db, id) {
+  try {
+    return await db.prepare('SELECT * FROM tracker_rules WHERE id = ?').bind(id).first();
+  } catch (e) {
+    console.error('[db] getTrackerRule error:', e.message);
+    return null;
+  }
+}
+
+export async function getTrackerRulesByStatus(db, status) {
+  try {
+    const { results } = await db.prepare('SELECT * FROM tracker_rules WHERE status = ? ORDER BY created_at DESC').bind(status).all();
+    return results || [];
+  } catch (e) {
+    console.error('[db] getTrackerRulesByStatus error:', e.message);
+    return [];
+  }
+}
+
+export async function updateTrackerRuleStatus(db, id, status) {
+  try {
+    let result;
+    if (status === 'active') {
+      result = await db.prepare(
+        `UPDATE tracker_rules
+         SET status = 'active',
+             arm_version = arm_version + 1,
+             updated_at = datetime('now')
+         WHERE id = ? AND (status = 'paused' OR status = 'triggered')`
+      ).bind(id).run();
+    } else {
+      result = await db.prepare("UPDATE tracker_rules SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(status, id).run();
+    }
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] updateTrackerRuleStatus error:', e.message);
+    return false;
+  }
+}
+
+export async function removeTrackerRule(db, id) {
+  try {
+    await db.prepare('DELETE FROM tracker_events WHERE rule_id = ?').bind(id).run();
+    const result = await db.prepare('DELETE FROM tracker_rules WHERE id = ?').bind(id).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] removeTrackerRule error:', e.message);
+    return false;
+  }
+}
+
+export async function atomicTriggerAndEnqueueStockNotification(db, {
+  ruleId,
+  armVersion,
+  lastValue,
+  lastObservedAt,
+  lastSource,
+  payload
+}) {
+  const payloadJson = typeof payload === 'object' ? JSON.stringify(payload) : payload;
+  const availableAt = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE tracker_rules
+       SET status = 'trigger_pending',
+           last_value = ?,
+           last_observed_at = ?,
+           last_source = ?,
+           updated_at = datetime('now')
+       WHERE id = ? AND status = 'active' AND arm_version = ?`
+    ).bind(lastValue, lastObservedAt, lastSource, ruleId, armVersion),
+    db.prepare(
+      `INSERT INTO notification_queue (kind, dedupe_key, payload_json, status, available_at)
+       SELECT 'stock', ?, ?, 'pending', ?
+       WHERE changes() > 0`
+    ).bind(`stock:rule:${ruleId}:${armVersion}`, payloadJson, availableAt)
+  ]);
+  return (results[0]?.meta?.changes || 0) > 0;
+}
+
+export async function addTrackerEvent(db, { ruleId, eventType, value, observedAt, source, details = {} }) {
+  try {
+    const detailsJson = typeof details === 'object' ? JSON.stringify(details) : details;
+    const result = await db.prepare(
+      `INSERT INTO tracker_events (rule_id, event_type, value, observed_at, source, details_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+    ).bind(ruleId, eventType, value, observedAt || null, source || null, detailsJson).run();
+    return result.meta.changes > 0;
+  } catch (e) {
+    console.error('[db] addTrackerEvent error:', e.message);
+    return false;
+  }
+}
+
+export async function getTrackerEvents(db, ruleId) {
+  try {
+    const { results } = await db.prepare('SELECT * FROM tracker_events WHERE rule_id = ? ORDER BY observed_at DESC, id DESC').bind(ruleId).all();
+    return results || [];
+  } catch (e) {
+    console.error('[db] getTrackerEvents error:', e.message);
+    return [];
+  }
+}

@@ -13,10 +13,9 @@ database_name = "social-rss-bridge-db"
 database_id = "ad708151-17c0-4cab-a4ee-a41033160154"
 migrations_dir = "migrations"
 
-# Cron Triggers — 每 10 分钟刷新一次，保证时效性；当某账号连续触发 Instagram
-# 401/403/429 风控时，会再尝试一次受保护的 HTTP 兜底刷新（best-effort，无法强制固定 colo）。
+# Cron Triggers — 每 5 分钟触发一次以刷新缓存与处理订阅/通知队列
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 FAILURE_ALERT_THRESHOLD = "10"
@@ -28,6 +27,7 @@ BASE_URL = "https://social-rss-bridge.xiaoan.workers.dev"
 FALLBACK_REFRESH_FAILURE_THRESHOLD = "3"
 FALLBACK_REFRESH_HTTP_STATUSES = "401,403,429"
 ENABLE_HTTP_FALLBACK_REFRESH = "true"
+DEEPSEEK_DAILY_LIMIT = "200"
 
 [observability]
 enabled = false
@@ -44,7 +44,11 @@ enabled = true
 persist = true
 head_sampling_rate = 1
 
-# Secrets (通过 wrangler secret put 设置，不进代码仓库):
-# TELEGRAM_BOT_TOKEN  - Telegram Bot Token
-# TELEGRAM_CHAT_ID    - Telegram 接收消息的 Chat ID
-# ADMIN_TOKEN         - 管理接口鉴权 Token
+# Secrets & Configs (通过 wrangler secret put 设置，不进代码仓库):
+# TELEGRAM_BOT_TOKEN       - 管理 Bot Token
+# TELEGRAM_CHAT_ID         - 管理接收消息/命令的 Chat ID
+# TELEGRAM_ADMIN_USER_ID   - 管理员的个人 User ID，用于限制其他用户在同一 chat 中执行命令
+# ADMIN_TOKEN              - 管理接口鉴权 Token / Webhook secret
+# PUSH_TELEGRAM_BOT_TOKEN  - 新建推送 Bot Token，专用于内容私人频道推送
+# PUSH_TELEGRAM_CHANNEL_ID - 内容推送私人频道 ID (e.g. -100xxx)
+# DEEPSEEK_API_KEY         - DeepSeek API 密钥，用于生成文章中文摘要
