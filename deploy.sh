@@ -238,8 +238,9 @@ if [ -n "$WORKER_URL" ]; then
   echo "🌐 服务地址: $WORKER_URL"
   echo ""
   echo "🤖 Telegram Bot 命令:"
-  echo "   /add_ig <username> [displayName]  — 添加 Instagram 订阅"
-  echo "   /list                              — 列出所有订阅"
-  echo "   /feeds                             — 查看 RSS 链接"
-  echo "   /help                              — 显示所有命令"
+  echo "   /gen_add instagram <username> [displayName]  — 添加 Instagram Generator"
+  echo "   /monitor_add stock <code> <gte|lte> <price>  — 添加股票监控"
+  echo "   /push_add rss <url>                           — 添加 RSS 订阅推送"
+  echo "   /status                                       — 查看服务状态"
+  echo "   /help                                         — 显示帮助"
 fi

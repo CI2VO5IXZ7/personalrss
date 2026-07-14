@@ -232,3 +232,112 @@ describe('Generator and Integrated Output Platform migrations (0007)', () => {
     ]);
   });
 });
+
+describe('Cleanup legacy tables migration (0008)', () => {
+  const migrations0008 = [
+    '0001_init.sql',
+    '0002_fix_unique_constraint.sql',
+    '0003_api_usage.sql',
+    '0004_post_meta_and_crawl_status.sql',
+    '0005_personal_info_hub.sql',
+    '0006_rss_secondary_dedupe_indexes.sql',
+    '0007_integrated_output_platform.sql',
+    '0008_drop_legacy_instagram_tables.sql'
+  ];
+
+  it('applies all migrations to a fresh database successfully', () => {
+    const db = new DatabaseSync(':memory:');
+    applyMigrations(db, migrations0008);
+
+    // Verify legacy tables do not exist
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+    expect(tables).not.toContain('accounts');
+    expect(tables).not.toContain('posts_cache');
+    expect(tables).not.toContain('crawl_status');
+    expect(tables).not.toContain('api_usage');
+
+    // Verify new tables exist
+    expect(tables).toContain('generator_instances');
+    expect(tables).toContain('tracker_rules');
+    expect(tables).toContain('rss_subscriptions');
+    expect(tables).toContain('notification_queue');
+    expect(tables).toContain('bot_sessions');
+    expect(tables).toContain('daily_usage');
+  });
+
+  it('preserves data in non-legacy tables when upgrading from 0007 to 0008 and removes legacy tables', () => {
+    const db = new DatabaseSync(':memory:');
+    const migrations0007 = migrations0008.slice(0, -1);
+    applyMigrations(db, migrations0007);
+
+    // Insert legacy and new data
+    db.exec(`
+      INSERT INTO accounts (platform, user_id, display_name) VALUES ('ig', 'test_user', 'Test Display');
+      INSERT INTO posts_cache (platform, user_id, post_id, canonical_id, date, link, image, description)
+      VALUES ('ig', 'test_user', 'post123', 'post123', '2026-07-14T03:00:00Z', 'https://inst.com/123', 'https://inst.com/img.jpg', 'hello');
+      INSERT INTO crawl_status (platform, user_id, consecutive_failures) VALUES ('ig', 'test_user', 0);
+      INSERT INTO api_usage (date, endpoint, calls) VALUES ('2026-07-14', 'instagram', 5);
+
+      INSERT INTO generator_instances (provider_type, instance_key, config_json)
+      VALUES ('stock', 'AAPL', '{"gte": 150}');
+
+      INSERT INTO tracker_rules (provider_type, target_key, target_config_json, condition_type, condition_value, status, arm_version)
+      VALUES ('stock', 'AAPL', '{"gte": 150}', 'price', 150.0, 'active', 1);
+
+      INSERT INTO rss_subscriptions (feed_url, feed_url_redacted) VALUES ('https://rss.com/feed', 'feed');
+
+      INSERT INTO notification_queue (kind, dedupe_key, payload_json, status)
+      VALUES ('rss', 'dedupe-pending', '{"msg":"test-pending"}', 'pending');
+
+      INSERT INTO bot_sessions (chat_id, flow, step, data_json) VALUES ('12345', 'setup', 'step1', '{"step":1}');
+      INSERT INTO daily_usage (usage_date, usage_type, count) VALUES ('2026-07-14', 'deepseek_summary', 5);
+    `);
+
+    // Apply 0008
+    db.exec(readMigration('0008_drop_legacy_instagram_tables.sql'));
+
+    // Verify legacy tables are gone
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+    expect(tables).not.toContain('accounts');
+    expect(tables).not.toContain('posts_cache');
+    expect(tables).not.toContain('crawl_status');
+    expect(tables).not.toContain('api_usage');
+
+    // Verify other tables and data are preserved
+    expect(db.prepare('SELECT * FROM generator_instances').all()).toEqual([
+      { id: 1, provider_type: 'stock', instance_key: 'AAPL', display_name: '', config_json: '{"gte": 150}', status: 'active', next_refresh_at: null, created_at: expect.any(String), updated_at: expect.any(String) }
+    ]);
+    expect(db.prepare('SELECT * FROM tracker_rules').all()).toEqual([
+      { id: 1, provider_type: 'stock', target_key: 'AAPL', target_config_json: '{"gte": 150}', condition_type: 'price', condition_value: 150, status: 'active', arm_version: 1, last_value: null, last_observed_at: null, last_source: null, triggered_at: null, created_at: expect.any(String), updated_at: expect.any(String) }
+    ]);
+    expect(db.prepare('SELECT * FROM rss_subscriptions').all()).toEqual([
+      { id: 1, feed_url: 'https://rss.com/feed', feed_url_redacted: 'feed', site_url: null, title: null, status: 'active', interval_minutes: 10, next_check_at: expect.any(String), etag: '', last_modified: '', last_checked_at: '', last_success_at: '', consecutive_failures: 0, last_error: '', created_at: expect.any(String), updated_at: expect.any(String) }
+    ]);
+    expect(db.prepare('SELECT * FROM notification_queue ORDER BY id').all()).toEqual([
+      { id: 1, kind: 'rss', dedupe_key: 'dedupe-pending', payload_json: '{"msg":"test-pending"}', status: 'pending', attempts: 0, available_at: expect.any(String), processing_started_at: null, lease_token: null, lease_expires_at: null, sent_at: null, last_error: null, created_at: expect.any(String) }
+    ]);
+    expect(db.prepare('SELECT * FROM bot_sessions').all()).toEqual([
+      { chat_id: '12345', flow: 'setup', step: 'step1', data_json: '{"step":1}', expires_at: null, updated_at: expect.any(String) }
+    ]);
+    expect(db.prepare('SELECT * FROM daily_usage').all()).toEqual([
+      { usage_date: '2026-07-14', usage_type: 'deepseek_summary', count: 5 }
+    ]);
+  });
+
+  it('can be run multiple times without error (idempotency)', () => {
+    const db = new DatabaseSync(':memory:');
+    applyMigrations(db, migrations0008.slice(0, -1)); // Up to 0007
+
+    // Run migration 0008 first time
+    expect(() => db.exec(readMigration('0008_drop_legacy_instagram_tables.sql'))).not.toThrow();
+
+    // Run migration 0008 second time
+    expect(() => db.exec(readMigration('0008_drop_legacy_instagram_tables.sql'))).not.toThrow();
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+    expect(tables).not.toContain('accounts');
+    expect(tables).not.toContain('posts_cache');
+    expect(tables).not.toContain('crawl_status');
+    expect(tables).not.toContain('api_usage');
+  });
+});
