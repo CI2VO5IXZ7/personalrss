@@ -33,10 +33,11 @@ describe('Notification Sender / Consumer', () => {
   });
 
   it('should process notification batch successfully', async () => {
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (1, 'url', 'url', 'active')").run();
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-1',
-      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+      dedupeKey: 'rss:1:key-1',
+      payload: { subscriptionId: 1, feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
     });
 
     const mockFetch = vi.fn().mockImplementation(async (url) => {
@@ -63,10 +64,11 @@ describe('Notification Sender / Consumer', () => {
   it('should fail and retry on Telegram 429 rate limit with correct backoff', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (1, 'url', 'url', 'active')").run();
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-1',
-      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+      dedupeKey: 'rss:1:key-1',
+      payload: { subscriptionId: 1, feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
     });
 
     const mockFetch = vi.fn().mockImplementation(async (url) => {
@@ -403,21 +405,24 @@ describe('Notification Sender / Consumer', () => {
   it('should not lease or increment attempts of later items when a Telegram 429 occurs on the first item', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (1, 'url1', 'url1', 'active')").run();
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (2, 'url2', 'url2', 'active')").run();
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (3, 'url3', 'url3', 'active')").run();
     // Enqueue 3 items
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-1',
-      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+      dedupeKey: 'rss:1:key-1',
+      payload: { subscriptionId: 1, feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
     });
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-2',
-      payload: { feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
+      dedupeKey: 'rss:2:key-2',
+      payload: { subscriptionId: 2, feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
     });
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-3',
-      payload: { feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
+      dedupeKey: 'rss:3:key-3',
+      payload: { subscriptionId: 3, feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
     });
 
     // Mock fetch to return 429 on the first request
@@ -448,19 +453,19 @@ describe('Notification Sender / Consumer', () => {
     expect(rows).toHaveLength(3);
 
     // First item: failed with 429, attempts incremented to 1, status reset to pending (or rescheduled)
-    expect(rows[0].dedupe_key).toBe('key-1');
+    expect(rows[0].dedupe_key).toBe('rss:1:key-1');
     expect(rows[0].status).toBe('pending');
     expect(rows[0].attempts).toBe(1);
     expect(rows[0].last_error).toContain('Flood control active');
     expect(rows[0].available_at).toBe('2026-07-13T08:00:30.000Z');
 
     // Second and third items: untouched! attempts=0, status=pending, last_error=null
-    expect(rows[1].dedupe_key).toBe('key-2');
+    expect(rows[1].dedupe_key).toBe('rss:2:key-2');
     expect(rows[1].status).toBe('pending');
     expect(rows[1].attempts).toBe(0);
     expect(rows[1].last_error).toBeNull();
 
-    expect(rows[2].dedupe_key).toBe('key-3');
+    expect(rows[2].dedupe_key).toBe('rss:3:key-3');
     expect(rows[2].status).toBe('pending');
     expect(rows[2].attempts).toBe(0);
     expect(rows[2].last_error).toBeNull();
@@ -468,26 +473,30 @@ describe('Notification Sender / Consumer', () => {
   });
 
   it('should process normal loop up to batchLimit', async () => {
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (1, 'url1', 'url1', 'active')").run();
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (2, 'url2', 'url2', 'active')").run();
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (3, 'url3', 'url3', 'active')").run();
+    await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (4, 'url4', 'url4', 'active')").run();
     // Enqueue 4 items
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-1',
-      payload: { feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
+      dedupeKey: 'rss:1:key-1',
+      payload: { subscriptionId: 1, feedTitle: 'Feed 1', entryTitle: 'Title 1', summary: 'Summary 1', link: 'https://link.com' }
     });
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-2',
-      payload: { feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
+      dedupeKey: 'rss:2:key-2',
+      payload: { subscriptionId: 2, feedTitle: 'Feed 2', entryTitle: 'Title 2', summary: 'Summary 2', link: 'https://link.com' }
     });
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-3',
-      payload: { feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
+      dedupeKey: 'rss:3:key-3',
+      payload: { subscriptionId: 3, feedTitle: 'Feed 3', entryTitle: 'Title 3', summary: 'Summary 3', link: 'https://link.com' }
     });
     await enqueue(db, {
       kind: 'rss',
-      dedupeKey: 'key-4',
-      payload: { feedTitle: 'Feed 4', entryTitle: 'Title 4', summary: 'Summary 4', link: 'https://link.com' }
+      dedupeKey: 'rss:4:key-4',
+      payload: { subscriptionId: 4, feedTitle: 'Feed 4', entryTitle: 'Title 4', summary: 'Summary 4', link: 'https://link.com' }
     });
 
     const mockFetch = vi.fn().mockImplementation(async (url) => {
@@ -512,20 +521,287 @@ describe('Notification Sender / Consumer', () => {
     const { results: rows } = await db.prepare('SELECT dedupe_key, status, attempts FROM notification_queue ORDER BY created_at ASC').all();
     expect(rows).toHaveLength(4);
 
-    expect(rows[0].dedupe_key).toBe('key-1');
+    expect(rows[0].dedupe_key).toBe('rss:1:key-1');
     expect(rows[0].status).toBe('sent');
     expect(rows[0].attempts).toBe(1);
 
-    expect(rows[1].dedupe_key).toBe('key-2');
+    expect(rows[1].dedupe_key).toBe('rss:2:key-2');
     expect(rows[1].status).toBe('sent');
     expect(rows[1].attempts).toBe(1);
 
-    expect(rows[2].dedupe_key).toBe('key-3');
+    expect(rows[2].dedupe_key).toBe('rss:3:key-3');
     expect(rows[2].status).toBe('sent');
     expect(rows[2].attempts).toBe(1);
 
-    expect(rows[3].dedupe_key).toBe('key-4');
+    expect(rows[3].dedupe_key).toBe('rss:4:key-4');
     expect(rows[3].status).toBe('pending');
     expect(rows[3].attempts).toBe(0);
+  });
+
+  describe('Pre-send subscription presence validation', () => {
+    it('should skip sending and complete notification if subscription has been removed', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (10, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: 10, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      await db.prepare("DELETE FROM rss_subscriptions WHERE id = 10").run();
+
+      const mockFetch = vi.fn();
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      const { results } = await db.prepare('SELECT status FROM notification_queue').all();
+      expect(results[0].status).toBe('sent');
+    });
+
+    it('should parse subscription ID from dedupe key if missing in payload', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (10, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      await db.prepare("DELETE FROM rss_subscriptions WHERE id = 10").run();
+
+      const mockFetch = vi.fn();
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      const { results } = await db.prepare('SELECT status FROM notification_queue').all();
+      expect(results[0].status).toBe('sent');
+    });
+
+    it('should fail closed and enter retry if subscription presence DB check fails', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (10, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: 10, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const originalPrepare = db.prepare;
+      db.prepare = vi.fn().mockImplementation((sql, ...args) => {
+        if (sql.includes('SELECT id FROM rss_subscriptions')) {
+          throw new Error('D1 connection lost');
+        }
+        return originalPrepare.call(db, sql, ...args);
+      });
+
+      const mockFetch = vi.fn();
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(0);
+
+      db.prepare = originalPrepare;
+
+      const row = await db.prepare('SELECT status, last_error FROM notification_queue').first();
+      expect(row.status).toBe('pending');
+      expect(row.last_error).toContain('D1 connection lost');
+    });
+
+    it('should NOT skip sending if subscription is paused', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (10, 'url', 'url', 'paused')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: 10, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 111 } })
+      });
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('should handle concurrent remove-in-flight: skip sending leased item if subscription is removed during processing', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (10, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: 10, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const { results: leased } = await db.prepare(
+        "UPDATE notification_queue SET status = 'processing', lease_token = 'token', lease_expires_at = datetime('now', '+300 seconds') RETURNING *"
+      ).all();
+      expect(leased).toHaveLength(1);
+
+      await db.prepare("DELETE FROM rss_subscriptions WHERE id = 10").run();
+
+      await db.prepare("UPDATE notification_queue SET status = 'pending', lease_token = NULL, lease_expires_at = NULL").run();
+
+      const mockFetch = vi.fn();
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('should log rss_subscription_removed_skip without dedupeKey', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: 10, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn();
+      await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(consoleSpy).toHaveBeenCalled();
+      const calls = consoleSpy.mock.calls;
+      const skipLogCall = calls.find(call => call[0].includes('sender.rss_subscription_removed_skip'));
+      expect(skipLogCall).toBeDefined();
+      const parsedLog = JSON.parse(skipLogCall[0]);
+      expect(parsedLog).toHaveProperty('notificationId');
+      expect(parsedLog).toHaveProperty('subscriptionId', 10);
+      expect(parsedLog).not.toHaveProperty('dedupeKey');
+      expect(parsedLog).not.toHaveProperty('dedupe_key');
+      consoleSpy.mockRestore();
+    });
+
+    it('should prioritize payload subscriptionId as a decimal string', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (15, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:10:entry1',
+        payload: { subscriptionId: "15", feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 111 } })
+      });
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('should fallback to strictly parsing dedupe_key when payload subscriptionId is invalid', async () => {
+      await db.prepare("INSERT INTO rss_subscriptions (id, feed_url, feed_url_redacted, status) VALUES (20, 'url', 'url', 'active')").run();
+
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:20:entry1',
+        payload: { subscriptionId: "invalid_sub_id", feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 111 } })
+      });
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(1);
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('should fail closed and enter retry when both payload subscriptionId and dedupe_key are invalid/missing', async () => {
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:invalid:entry1',
+        payload: { subscriptionId: "invalid_sub_id", feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn();
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      const row = await db.prepare('SELECT status, last_error, attempts FROM notification_queue').first();
+      expect(row.status).toBe('pending');
+      expect(row.attempts).toBe(1);
+      expect(row.last_error).toContain('Invalid or missing subscriptionId');
+    });
+
+    it('should fail closed and enter retry if subscriptionId is negative or 0', async () => {
+      await enqueue(db, {
+        kind: 'rss',
+        dedupeKey: 'rss:0:entry1',
+        payload: { subscriptionId: 0, feedTitle: 'Feed', entryTitle: 'Title', summary: 'Summary' }
+      });
+
+      const mockFetch = vi.fn();
+
+      const count = await processNotificationBatch(
+        db,
+        { PUSH_TELEGRAM_BOT_TOKEN: 'push-token', PUSH_TELEGRAM_CHANNEL_ID: 'push-channel' },
+        { fetchFn: mockFetch }
+      );
+
+      expect(count).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      const row = await db.prepare('SELECT status, last_error, attempts FROM notification_queue').first();
+      expect(row.status).toBe('pending');
+      expect(row.attempts).toBe(1);
+      expect(row.last_error).toContain('Invalid or missing subscriptionId');
+    });
   });
 });

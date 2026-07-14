@@ -19,7 +19,7 @@ describe('RSS Scheduler / Processor', () => {
     db.exec(migrationSql);
   });
 
-  it('should establish first-subscription baseline without enqueuing notifications', async () => {
+  it('should establish first-subscription baseline and only enqueue the newest 1 entry', async () => {
     const feedXml = `
       <rss version="2.0">
         <channel>
@@ -56,9 +56,10 @@ describe('RSS Scheduler / Processor', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0].entry_key).toBe('guid-1');
 
-    // Notification queue should be empty (no historical push)
+    // Notification queue should contain exactly 1 notification (the newest one)
     const { results: notifications } = await db.prepare('SELECT * FROM notification_queue').all();
-    expect(notifications).toHaveLength(0);
+    expect(notifications).toHaveLength(1);
+    expect(JSON.parse(notifications[0].payload_json).entryTitle).toBe('Baseline Item 1');
 
     // Last success/check timestamps should be updated
     const updatedSub = await db.prepare('SELECT * FROM rss_subscriptions WHERE id = ?').bind(sub.id).first();
@@ -142,15 +143,13 @@ describe('RSS Scheduler / Processor', () => {
     expect(res.success).toBe(true);
     expect(res.count).toBe(2);
 
-    // Notifications should be enqueued chronologically: oldest (Item 2) first, then Newer (Item 3)
+    // Notifications should be enqueued: Baseline Item 1 first, then Older Item 2, then Newer Item 3
     const { results: notifications } = await db.prepare('SELECT * FROM notification_queue ORDER BY id ASC').all();
-    expect(notifications).toHaveLength(2);
+    expect(notifications).toHaveLength(3);
     
-    const payload1 = JSON.parse(notifications[0].payload_json);
-    expect(payload1.entryTitle).toBe('Older Item 2');
-
-    const payload2 = JSON.parse(notifications[1].payload_json);
-    expect(payload2.entryTitle).toBe('Newer Item 3');
+    expect(JSON.parse(notifications[0].payload_json).entryTitle).toBe('Baseline Item 1');
+    expect(JSON.parse(notifications[1].payload_json).entryTitle).toBe('Older Item 2');
+    expect(JSON.parse(notifications[2].payload_json).entryTitle).toBe('Newer Item 3');
   });
 
   it('should fetch original page when content is insufficient and call DeepSeek', async () => {
@@ -242,7 +241,7 @@ describe('RSS Scheduler / Processor', () => {
     expect(result.count).toBe(0);
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(1);
-    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(1);
   });
 
   it('does not notify when GUID and link change but normalized article content is unchanged', async () => {
@@ -269,7 +268,7 @@ describe('RSS Scheduler / Processor', () => {
     expect(result.count).toBe(0);
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect((await db.prepare('SELECT * FROM rss_entries').all()).results).toHaveLength(1);
-    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM notification_queue').all()).results).toHaveLength(1);
   });
 
   it('atomically claims concurrent overlapping processing so only one notification is queued', async () => {
@@ -509,6 +508,112 @@ describe('RSS Scheduler / Processor', () => {
 
     const payloadUnsafeImg = JSON.parse(notifications[1].payload_json);
     expect(payloadUnsafeImg.imageUrl).toBe(''); // Omitted
+  });
+
+  it('first check: should select entry with maximum publishedAt time when dates are valid', async () => {
+    const feedXml = `
+      <rss version="2.0">
+        <channel>
+          <title>Test Feed</title>
+          <link>https://test.com</link>
+          <item>
+            <title>Item A</title>
+            <link>https://test.com/a</link>
+            <guid>guid-a</guid>
+            <pubDate>Mon, 13 Jul 2026 12:00:00 GMT</pubDate>
+          </item>
+          <item>
+            <title>Item B</title>
+            <link>https://test.com/b</link>
+            <guid>guid-b</guid>
+            <pubDate>Mon, 13 Jul 2026 14:00:00 GMT</pubDate>
+          </item>
+          <item>
+            <title>Item C</title>
+            <link>https://test.com/c</link>
+            <guid>guid-c</guid>
+            <pubDate>Mon, 13 Jul 2026 13:00:00 GMT</pubDate>
+          </item>
+        </channel>
+      </rss>
+    `;
+    const mockFetch = vi.fn().mockResolvedValue({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/rss+xml' }),
+      text: async () => feedXml
+    });
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    const [sub] = await getRssSubscriptions(db);
+    await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
+    const { results: notifications } = await db.prepare('SELECT * FROM notification_queue').all();
+    expect(notifications).toHaveLength(1);
+    expect(JSON.parse(notifications[0].payload_json).entryTitle).toBe('Item B'); // max time
+  });
+
+  it('first check: should select first entry in source order when they have the same publishedAt time', async () => {
+    const feedXml = `
+      <rss version="2.0">
+        <channel>
+          <title>Test Feed</title>
+          <link>https://test.com</link>
+          <item>
+            <title>Item A</title>
+            <link>https://test.com/a</link>
+            <guid>guid-a</guid>
+            <pubDate>Mon, 13 Jul 2026 12:00:00 GMT</pubDate>
+          </item>
+          <item>
+            <title>Item B</title>
+            <link>https://test.com/b</link>
+            <guid>guid-b</guid>
+            <pubDate>Mon, 13 Jul 2026 12:00:00 GMT</pubDate>
+          </item>
+        </channel>
+      </rss>
+    `;
+    const mockFetch = vi.fn().mockResolvedValue({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/rss+xml' }),
+      text: async () => feedXml
+    });
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    const [sub] = await getRssSubscriptions(db);
+    await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
+    const { results: notifications } = await db.prepare('SELECT * FROM notification_queue').all();
+    expect(notifications).toHaveLength(1);
+    expect(JSON.parse(notifications[0].payload_json).entryTitle).toBe('Item A'); // first in source feed order
+  });
+
+  it('first check: should select first entry in source order when all entries have no date', async () => {
+    const feedXml = `
+      <rss version="2.0">
+        <channel>
+          <title>Test Feed</title>
+          <link>https://test.com</link>
+          <item>
+            <title>Item A</title>
+            <link>https://test.com/a</link>
+            <guid>guid-a</guid>
+          </item>
+          <item>
+            <title>Item B</title>
+            <link>https://test.com/b</link>
+            <guid>guid-b</guid>
+          </item>
+        </channel>
+      </rss>
+    `;
+    const mockFetch = vi.fn().mockResolvedValue({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/rss+xml' }),
+      text: async () => feedXml
+    });
+    await addRssSubscription(db, 'https://test.com/feed.xml', 'https://test.com/feed.xml', '', '', 10);
+    const [sub] = await getRssSubscriptions(db);
+    await processSubscription(db, sub, {}, { resolver: publicResolver, fetchFn: mockFetch });
+    const { results: notifications } = await db.prepare('SELECT * FROM notification_queue').all();
+    expect(notifications).toHaveLength(1);
+    expect(JSON.parse(notifications[0].payload_json).entryTitle).toBe('Item A'); // first in source feed order
   });
 });
 
