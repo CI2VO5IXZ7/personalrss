@@ -46,6 +46,9 @@ jobs:
       - name: Apply D1 Migrations
         run: npx wrangler d1 migrations apply social-rss-bridge-db --remote
 
+      - name: Deploy
+        run: npx wrangler deploy
+
       - name: Sync Worker Secrets
         shell: bash
         run: |
@@ -85,9 +88,6 @@ jobs:
           process.stdout.write(JSON.stringify(values));
           NODE
 
-      - name: Deploy
-        run: npx wrangler deploy
-
       - name: Setup Telegram Webhook
         shell: bash
         run: |
@@ -109,11 +109,41 @@ jobs:
 
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          curl --silent --show-error --fail-with-body \
-            --output "$response_file" \
-            --request POST \
-            --header "Authorization: Bearer ${ADMIN_TOKEN}" \
-            "${BASE_URL}/setup-webhook"
+          max_attempts=10
+          retry_delay_seconds=3
+
+          for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+            if ! http_status="$(
+              curl --silent --show-error \
+                --output "$response_file" \
+                --write-out '%{http_code}' \
+                --request POST \
+                --header "Authorization: Bearer ${ADMIN_TOKEN}" \
+                "${BASE_URL}/setup-webhook"
+            )"; then
+              printf 'Webhook setup request failed due to a transport error.\n' >&2
+              exit 1
+            fi
+
+            if [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              break
+            fi
+
+            if [[ "$http_status" == "401" || "$http_status" =~ ^5[0-9][0-9]$ ]]; then
+              if (( attempt == max_attempts )); then
+                printf 'Webhook setup failed after %d attempts (last HTTP status %s).\n' \
+                  "$max_attempts" "$http_status" >&2
+                exit 1
+              fi
+              printf 'Webhook setup returned retryable HTTP status %s; retrying (%d/%d).\n' \
+                "$http_status" "$attempt" "$max_attempts" >&2
+              sleep "$retry_delay_seconds"
+              continue
+            fi
+
+            printf 'Webhook setup failed with non-retryable HTTP status %s.\n' "$http_status" >&2
+            exit 1
+          done
 
           WEBHOOK_RESPONSE_FILE="$response_file" node --input-type=module <<'NODE'
           import fs from 'node:fs';

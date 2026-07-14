@@ -62,7 +62,10 @@ describe('manual deployment workflow', () => {
     expect(sync).toContain('exit 1');
     expect(sync).toMatch(/node[\s\S]*\|\s*npx wrangler secret bulk(?:\s|$)/);
     expect(sync).not.toMatch(/(?:>|tee\b).*secret/i);
-    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('- name: Deploy'));
+    expect(workflow.indexOf('- name: Deploy')).toBeLessThan(workflow.indexOf('Sync Worker Secrets'));
+    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('Setup Telegram Webhook'));
+    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(workflow.indexOf('Verify Push Telegram Delivery'));
+    expect(workflow.indexOf('Setup Telegram Webhook')).toBeLessThan(workflow.indexOf('Verify Push Telegram Delivery'));
   });
 
   it('never enables xtrace or expands GitHub secrets inside shell scripts', () => {
@@ -75,16 +78,16 @@ describe('manual deployment workflow', () => {
     expect(runBlocks).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*\$\{?(?:TELEGRAM_|ADMIN_TOKEN|DEEPSEEK_|PUSH_)/m);
   });
 
-  it('deploys only after migrations and secret synchronization', () => {
+  it('deploys after migrations but before secret synchronization', () => {
     const deploy = stepBody('Deploy');
     const deployPosition = workflow.indexOf('- name: Deploy');
 
     expect(deploy).toContain('npx wrangler deploy');
     expect(workflow.indexOf('Apply D1 Migrations')).toBeLessThan(deployPosition);
-    expect(workflow.indexOf('Sync Worker Secrets')).toBeLessThan(deployPosition);
+    expect(deployPosition).toBeLessThan(workflow.indexOf('Sync Worker Secrets'));
   });
 
-  it('safely parses BASE_URL and authenticates a failing-fast webhook POST', () => {
+  it('safely parses BASE_URL and authenticates the webhook POST', () => {
     const webhook = stepBody('Setup Telegram Webhook');
 
     expect(webhook).toContain('set -euo pipefail');
@@ -92,10 +95,25 @@ describe('manual deployment workflow', () => {
     expect(webhook).toContain('JSON.parse(match[1])');
     expect(webhook).not.toMatch(/\b(?:source|eval|grep|sed|awk)\b/);
     expect(webhook).toContain('--request POST');
-    expect(webhook).toContain('Authorization: Bearer ${ADMIN_TOKEN}');
-    expect(webhook).toContain('--fail-with-body');
+    expect(webhook).toContain('Authorization: Bearer ${' + 'ADMIN_TOKEN}');
+    expect(webhook).not.toContain('--fail-with-body');
     expect(webhook).toMatch(/payload\.webhook\?\.ok[\s\S]*payload\.commands\?\.ok/);
     expect(webhook).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*ADMIN_TOKEN/m);
+    expect(webhook).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+  });
+
+  it('bounds webhook retries for 401 and 5xx responses before validating success', () => {
+    const webhook = stepBody('Setup Telegram Webhook');
+
+    expect(webhook).toContain('max_attempts=10');
+    expect(webhook).toContain('retry_delay_seconds=3');
+    expect(webhook).toMatch(/for \(\( attempt=1; attempt<=max_attempts; attempt\+\+ \)\)/);
+    expect(webhook).toContain("--write-out '%{http_code}'");
+    expect(webhook).toMatch(/http_status[\s\S]*==\s*"401"/);
+    expect(webhook).toMatch(/http_status[\s\S]*\^5\[0-9\]\[0-9\]\$/);
+    expect(webhook).toMatch(/attempt\s*==\s*max_attempts[\s\S]*exit 1/);
+    expect(webhook).toContain('sleep "$retry_delay_seconds"');
+    expect(webhook.indexOf('for (( attempt=1')).toBeLessThan(webhook.indexOf('WEBHOOK_RESPONSE_FILE='));
   });
 
   it('performs a failing-fast real push delivery smoke test without logging secrets', () => {
