@@ -210,6 +210,33 @@ jobs:
           }
           NODE
 
+          if ! info_status="$(
+            curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+          )"; then
+            printf '{"stage":"getWebhookInfo","status":null,"message":"Telegram getWebhookInfo transport request failed"}\n' >&2
+            exit 1
+          fi
+
+          WEBHOOK_INFO_FILE="$response_file" HTTP_STATUS="$info_status" BASE_URL="$BASE_URL" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          let payload = null;
+          try {
+            payload = JSON.parse(fs.readFileSync(process.env.WEBHOOK_INFO_FILE, 'utf8'));
+          } catch {}
+
+          const expected = `${process.env.BASE_URL}/telegram`;
+          const actual = payload?.result?.url || '';
+          if (!/^2\d\d$/.test(process.env.HTTP_STATUS) || payload?.ok !== true || actual !== expected) {
+            const status = Number(process.env.HTTP_STATUS) || null;
+            process.stderr.write(`${JSON.stringify({ stage: 'getWebhookInfo', status, message: 'Telegram webhook URL verification failed' })}\n`);
+            process.exit(1);
+          }
+          NODE
+
       - name: Verify Push Telegram Delivery
         shell: bash
         run: |

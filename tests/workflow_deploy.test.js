@@ -110,6 +110,9 @@ describe('manual deployment workflow', () => {
     expect(webhook).toContain('Authorization: Bearer ${' + 'ADMIN_TOKEN}');
     expect(webhook).not.toContain('--fail-with-body');
     expect(webhook).toMatch(/payload\.webhook\?\.ok[\s\S]*payload\.commands\?\.ok/);
+    expect(webhook).toContain('getWebhookInfo');
+    expect(webhook).toContain('Telegram webhook URL verification failed');
+    expect(webhook).toContain('actual !== expected');
     expect(webhook).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*ADMIN_TOKEN/m);
     expect(webhook).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
   });
