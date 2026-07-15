@@ -3,7 +3,7 @@ import { deriveWebhookSecret, verifyWebhookSecret, sendMessage, parseCommand, se
 import { handleCommand, isKnownCommand } from './commands.js';
 import { handleSessionMessage, cancelSession } from './sessions.js';
 import { getTelegramBotCommands, buildTelegramHelpMessage } from '../telegram_commands.js';
-import { getBotSession } from '../db.js';
+import { getBotSession, clearBotSession } from '../db.js';
 import { escapeHtml } from '../html.js';
 import { redactText } from '../security/url.js';
 import { logError, logInfo, logWarn } from '../log.js';
@@ -89,8 +89,33 @@ export function createTelegramRouter({ generatorService, monitorService, pushSer
 
     if (session) {
       const parsed = parseCommand(msg.text);
-      if (parsed && parsed.cmd === 'cancel') {
-        c.executionCtx.waitUntil(cancelSession(db, chatId, token));
+      if (parsed) {
+        if (parsed.cmd === 'cancel') {
+          c.executionCtx.waitUntil(cancelSession(db, chatId, token));
+          return c.text('ok');
+        }
+        if (isKnownCommand(parsed.cmd)) {
+          c.executionCtx.waitUntil((async () => {
+            await clearBotSession(db, chatId);
+            await handleCommand({
+              cmd: parsed.cmd,
+              args: parsed.args,
+              env: c.env,
+              chatId,
+              token,
+              db,
+              services: { generator: generatorService, monitor: monitorService, push: pushService },
+              req: c.req.raw
+            });
+          })());
+          return c.text('ok');
+        }
+        // Unknown slash command
+        c.executionCtx.waitUntil(sendMessage(
+          token,
+          chatId,
+          `未知命令 /${escapeHtml(parsed.cmd)}，发送 /help 查看可用命令，或发送 /cancel 退出当前会话。`
+        ));
         return c.text('ok');
       }
       c.executionCtx.waitUntil(handleSessionMessage({

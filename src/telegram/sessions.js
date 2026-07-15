@@ -19,15 +19,10 @@ export async function startSession(db, chatId, flow, step, data, token, prompt) 
   await sendMessage(token, chatId, prompt);
 }
 
-async function handleMonitorAddSession(session, text, {
-  env, chatId, token, db, services, req
-}) {
-  const input = text.trim();
-  const monitorService = services.monitor;
-
-  if (session.step === 'await_code') {
-    await sendMessage(token, chatId, `🔎 正在查询股票 <code>${escapeHtml(input)}</code> 行情...`);
-    const quote = await monitorService.getQuote(db, input, {
+export async function handleStockCodeInput(db, chatId, codeInput, token, monitorService) {
+  await sendMessage(token, chatId, `🔎 正在查询股票 <code>${escapeHtml(codeInput)}</code> 行情...`);
+  try {
+    const quote = await monitorService.getQuote(db, codeInput, {
       fetchFn: globalThis.fetch,
       relativeTo: new Date()
     });
@@ -46,6 +41,28 @@ async function handleMonitorAddSession(session, text, {
       token,
       `📈 股票：<code>${escapeHtml(quote.symbol)}</code>\n当前价格：<b>${quote.price}</b>\n\n请输入阈值条件和目标价格（例如：<code>gte 1800</code> 或 <code>lte 10</code>）：\n(发送 /cancel 退出)`
     );
+  } catch (err) {
+    const errorMsg = redactText(err.message || '未知错误');
+    await startSession(
+      db,
+      chatId,
+      'monitor_add',
+      'await_code',
+      {},
+      token,
+      `❌ 查询失败：${escapeHtml(errorMsg)}\n\n请输入正确的股票代码（例如：SHA:603986、SH:603986、SZ:000001 或 603986）：\n(发送 /cancel 退出)`
+    );
+  }
+}
+
+async function handleMonitorAddSession(session, text, {
+  env, chatId, token, db, services, req
+}) {
+  const input = text.trim();
+  const monitorService = services.monitor;
+
+  if (session.step === 'await_code') {
+    await handleStockCodeInput(db, chatId, input, token, monitorService);
     return;
   }
 

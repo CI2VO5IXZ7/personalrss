@@ -477,4 +477,190 @@ describe('Telegram Production Command Namespace', () => {
 
     spy.mockRestore();
   });
+
+  describe('Telegram Monitor UX and Session Regression Tests', () => {
+    const makeDynamicStockFetch = (price = '10.50') => {
+      return vi.fn().mockImplementation((url) => {
+        if (url.includes('sqt.gtimg.cn')) {
+          const match = url.match(/q=((?:sh|sz|bj)\d{6})/);
+          const symbol = match ? match[1] : 'sh603986';
+          const code = symbol.slice(2);
+          return Promise.resolve({
+            status: 200,
+            text: async () => `v_${symbol}="1~StockName~${code}~${price}~10.00~10.05~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260713153701~0";`
+          });
+        }
+        return Promise.resolve({ status: 200, ok: true, json: async () => ({ ok: true }) });
+      });
+    };
+
+    it('should handle /monitor_add stock SHA:603986, transition to await_condition_price, and clear on /monitor_list', async () => {
+      const mockFetch = makeDynamicStockFetch('10.50');
+      globalThis.fetch = mockFetch;
+
+      // Send /monitor_add stock SHA:603986
+      const promise1 = await sendWebhook('/monitor_add stock SHA:603986');
+      await promise1;
+
+      // Verify session state
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.flow).toBe('monitor_add');
+      expect(session.step).toBe('await_condition_price');
+      const data = JSON.parse(session.data_json);
+      expect(data.code).toBe('sh603986');
+      expect(data.currentPrice).toBe(10.5);
+
+      // Verify the user received the prompt with the price
+      const text1 = getLastMessageText(mockFetch);
+      expect(text1).toContain('当前价格：<b>10.5</b>');
+      expect(text1).toContain('请输入阈值条件和目标价格');
+
+      // Clear calls
+      mockFetch.mockClear();
+
+      // Send /monitor_list
+      const promise2 = await sendWebhook('/monitor_list');
+      await promise2;
+
+      // Verify session is cleared
+      session = await getBotSession(db, '12345');
+      expect(session).toBeNull();
+
+      // Verify getQuote was NOT called (i.e. no calls to gtimg or sinajs with monitor_list)
+      const quoteCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && (c[0].includes('sqt.gtimg.cn') || c[0].includes('sinajs.cn')));
+      expect(quoteCalls).toHaveLength(0);
+
+      // Verify /monitor_list response was sent
+      const listText = getLastMessageText(mockFetch);
+      expect(listText).toContain('暂无股票提醒'); // because we haven't added any yet
+    });
+
+    it('should support conversational await_code flow with SHA:603986 and query failures', async () => {
+      const mockFetch = makeDynamicStockFetch('10.50');
+      globalThis.fetch = mockFetch;
+
+      // Start session
+      await (await sendWebhook('/monitor_add'));
+      let session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_code');
+
+      // Input SHA:603986
+      await (await sendWebhook('SHA:603986'));
+      session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_condition_price');
+      expect(JSON.parse(session.data_json).code).toBe('sh603986');
+
+      // Cancel to reset
+      await (await sendWebhook('/cancel'));
+      session = await getBotSession(db, '12345');
+      expect(session).toBeNull();
+
+      // Start session again
+      await (await sendWebhook('/monitor_add'));
+      session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_code');
+
+      // Mock query failure (e.g. fetch fails or returns invalid format)
+      mockFetch.mockImplementation((url) => {
+        if (url.includes('sqt.gtimg.cn') || url.includes('sinajs.cn')) {
+          return Promise.reject(new Error('Network error exposing secret_token'));
+        }
+        return Promise.resolve({ status: 200, ok: true, json: async () => ({ ok: true }) });
+      });
+      mockFetch.mockClear();
+
+      // Input any code to trigger query failure
+      await (await sendWebhook('603986'));
+
+      // Session should remain in await_code
+      session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_code');
+
+      // User should receive a safe, redacted error message and format examples
+      const failureText = getLastMessageText(mockFetch);
+      expect(failureText).toContain('查询失败');
+      expect(failureText).toContain('All stock quote providers failed');
+      expect(failureText).not.toContain('secret_token'); // must be redacted
+      expect(failureText).toContain('SHA:603986'); // format example
+    });
+
+    it('should not query or clear session for unknown slash commands', async () => {
+      const mockFetch = makeDynamicStockFetch('10.50');
+      globalThis.fetch = mockFetch;
+
+      // Start session
+      await (await sendWebhook('/monitor_add'));
+      let session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_code');
+
+      // Send unknown slash command
+      mockFetch.mockClear();
+      await (await sendWebhook('/unknown_cmd'));
+
+      // Session should still be active
+      session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_code');
+
+      // Quote should not be queried
+      const quoteCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && (c[0].includes('sqt.gtimg.cn') || c[0].includes('sinajs.cn')));
+      expect(quoteCalls).toHaveLength(0);
+
+      // Warning message should be sent
+      const msgText = getLastMessageText(mockFetch);
+      expect(msgText).toContain('未知命令 /unknown_cmd');
+      expect(msgText).toContain('/cancel');
+    });
+
+    it('creates a stock rule with /monitor_add stock SHA:603986 gte 20', async () => {
+      const mockFetch = makeDynamicStockFetch('25.00');
+      globalThis.fetch = mockFetch;
+
+      const promise = await sendWebhook('/monitor_add stock SHA:603986 gte 20');
+      await promise;
+
+      const { results: rules } = await db.prepare('SELECT * FROM tracker_rules').all();
+      expect(rules).toHaveLength(1);
+      expect(rules[0].target_key).toBe('sh603986');
+      expect(rules[0].condition_type).toBe('gte');
+      expect(rules[0].condition_value).toBe(20);
+
+      const lastText = getLastMessageText(mockFetch);
+      expect(lastText).toContain('已添加股票提醒规则');
+      expect(lastText).toContain('sh603986');
+    });
+
+    it('should only clear session and send one cancel confirmation on /cancel in active monitor session without querying market or re-entering handleCommand', async () => {
+      const mockFetch = makeDynamicStockFetch('10.50');
+      globalThis.fetch = mockFetch;
+
+      // Start an active monitor session
+      await (await sendWebhook('/monitor_add'));
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_code');
+
+      // Clear mock calls to focus only on /cancel behavior
+      mockFetch.mockClear();
+
+      // Send /cancel
+      await (await sendWebhook('/cancel'));
+
+      // 1) Verify session is cleared
+      session = await getBotSession(db, '12345');
+      expect(session).toBeNull();
+
+      // 2) Verify exactly one sendMessage call is sent (cancellation confirmation)
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      const cancelText = JSON.parse(sendMsgCalls[0][1].body).text;
+      expect(cancelText).toContain('已取消当前会话');
+
+      // 3) Verify market quotes are never queried
+      const quoteCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && (c[0].includes('sqt.gtimg.cn') || c[0].includes('sinajs.cn')));
+      expect(quoteCalls).toHaveLength(0);
+    });
+  });
 });

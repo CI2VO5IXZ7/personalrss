@@ -3,7 +3,7 @@ import { getTelegramBotCommands } from '../telegram_commands.js';
 import { escapeHtml } from '../html.js';
 import { redactText } from '../security/url.js';
 import { clearBotSession } from '../db.js';
-import { startSession } from './sessions.js';
+import { startSession, handleStockCodeInput } from './sessions.js';
 
 function parsePositiveInteger(value) {
   const str = String(value).trim();
@@ -285,34 +285,46 @@ export async function handleCommand({
       }
 
       case 'monitor_add': {
-        if (args.length < 4 || args[0].toLowerCase() !== 'stock') {
-          if (args.length > 0 && args[0].toLowerCase() !== 'stock') {
-            await sendMessage(token, chatId, '❌ 用法：/monitor_add stock &lt;code&gt; &lt;gte|lte&gt; &lt;price&gt;');
+        // Case 1: Full 4 parameters: /monitor_add stock <code> <gte|lte> <price>
+        if (args.length >= 4 && args[0].toLowerCase() === 'stock') {
+          const code = args[1].trim();
+          const condition = args[2].trim().toLowerCase();
+          const price = parseFloat(args[3].trim());
+          if (condition !== 'gte' && condition !== 'lte') {
+            await sendMessage(token, chatId, '❌ 条件必须为 gte 或 lte。');
             break;
           }
+          if (Number.isNaN(price) || price <= 0) {
+            await sendMessage(token, chatId, '❌ 目标价必须是正数。');
+            break;
+          }
+          const rule = await monitorService.addStock(db, code, condition, price);
+          const condSymbol = condition === 'gte' ? '≥' : '≤';
+          await sendMessage(token, chatId,
+            `✅ 已添加股票提醒规则：<code>${escapeHtml(rule.targetKey)}</code> ${condSymbol} ${rule.conditionValue}\n` +
+            `ID: <b>${rule.id}</b>`
+          );
+          break;
+        }
+
+        // Case 2: Incomplete args but with stock and code: /monitor_add stock <code>
+        if (args.length === 2 && args[0].toLowerCase() === 'stock') {
+          const code = args[1].trim();
+          await handleStockCodeInput(db, chatId, code, token, monitorService);
+          break;
+        }
+
+        // Case 3: No args, or just 'stock': /monitor_add or /monitor_add stock
+        if (args.length === 0 || (args.length === 1 && args[0].toLowerCase() === 'stock')) {
           await startSession(
             db, chatId, 'monitor_add', 'await_code', {}, token,
             '请输入股票代码：\n(发送 /cancel 退出)'
           );
           break;
         }
-        const code = args[1].trim();
-        const condition = args[2].trim().toLowerCase();
-        const price = parseFloat(args[3].trim());
-        if (condition !== 'gte' && condition !== 'lte') {
-          await sendMessage(token, chatId, '❌ 条件必须为 gte 或 lte。');
-          break;
-        }
-        if (Number.isNaN(price) || price <= 0) {
-          await sendMessage(token, chatId, '❌ 目标价必须是正数。');
-          break;
-        }
-        const rule = await monitorService.addStock(db, code, condition, price);
-        const condSymbol = condition === 'gte' ? '≥' : '≤';
-        await sendMessage(token, chatId,
-          `✅ 已添加股票提醒规则：<code>${escapeHtml(rule.targetKey)}</code> ${condSymbol} ${rule.conditionValue}\n` +
-          `ID: <b>${rule.id}</b>`
-        );
+
+        // Case 4: Other invalid formats
+        await sendMessage(token, chatId, '❌ 用法：/monitor_add stock &lt;code&gt; &lt;gte|lte&gt; &lt;price&gt;');
         break;
       }
 

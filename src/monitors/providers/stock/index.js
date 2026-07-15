@@ -10,6 +10,21 @@ export function normalizeSymbol(symbol) {
     return match[0];
   }
 
+  // Check for colon-prefixed symbols
+  const colonMatch = s.match(/^(sha|sh|sse|she|sz|szse|bse|bj)\s*:\s*(\d{6})$/);
+  if (colonMatch) {
+    const [, prefix, code] = colonMatch;
+    if (['sha', 'sh', 'sse'].includes(prefix)) {
+      return 'sh' + code;
+    }
+    if (['she', 'sz', 'szse'].includes(prefix)) {
+      return 'sz' + code;
+    }
+    if (['bse', 'bj'].includes(prefix)) {
+      return 'bj' + code;
+    }
+  }
+
   // 6-digit numeric codes
   if (/^\d{6}$/.test(s)) {
     if (s.startsWith('920')) return 'bj' + s;

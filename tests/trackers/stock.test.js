@@ -38,6 +38,27 @@ describe('A-share Symbol Normalization', () => {
     expect(normalizeSymbol('')).toBeNull();
     expect(normalizeSymbol(null)).toBeNull();
   });
+
+  it('should normalize common exchange prefixes with colon', () => {
+    expect(normalizeSymbol('SHA:603986')).toBe('sh603986');
+    expect(normalizeSymbol('SH:603986')).toBe('sh603986');
+    expect(normalizeSymbol('SSE:603986')).toBe('sh603986');
+    expect(normalizeSymbol('SHE:000001')).toBe('sz000001');
+    expect(normalizeSymbol('SZ:000001')).toBe('sz000001');
+    expect(normalizeSymbol('SZSE:000001')).toBe('sz000001');
+    expect(normalizeSymbol('BSE:920001')).toBe('bj920001');
+    expect(normalizeSymbol('BJ:920001')).toBe('bj920001');
+
+    // Test case and spacing tolerance
+    expect(normalizeSymbol('  sha:603986  ')).toBe('sh603986');
+    expect(normalizeSymbol('Sh:603986')).toBe('sh603986');
+    expect(normalizeSymbol('SZSE : 000001')).toBe('sz000001');
+
+    // Invalid prefixes/lengths should return null
+    expect(normalizeSymbol('XYZ:603986')).toBeNull();
+    expect(normalizeSymbol('SHA:60398')).toBeNull();
+    expect(normalizeSymbol('SHA:6039867')).toBeNull();
+  });
 });
 
 describe('Tencent UTF-8 Parsing', () => {
