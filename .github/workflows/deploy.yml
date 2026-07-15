@@ -1,6 +1,15 @@
 name: Deploy Worker
 on:
   workflow_dispatch:
+    inputs:
+      management_smoke_command:
+        description: 'Management smoke command to run'
+        type: choice
+        required: true
+        default: '/help'
+        options:
+          - '/help'
+          - '/monitor_add'
 
 permissions:
   contents: read
@@ -264,7 +273,9 @@ jobs:
           }
           NODE
 
-      - name: Verify Management Help Command
+      - name: Verify Management Command
+        env:
+          MANAGEMENT_SMOKE_COMMAND: ${{ inputs.management_smoke_command || '/help' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -301,7 +312,7 @@ jobs:
             message: {
               chat: { id: Number(process.env.TELEGRAM_CHAT_ID), type: "private" },
               from: { id: Number(process.env.TELEGRAM_ADMIN_USER_ID) },
-              text: '/help'
+              text: process.env.MANAGEMENT_SMOKE_COMMAND
             }
           };
           fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
@@ -319,7 +330,7 @@ jobs:
           import fs from 'node:fs';
           const response = fs.readFileSync(process.env.RESPONSE_FILE, 'utf8');
           if (response !== 'ok') {
-            throw new Error('Telegram /help command response was not ok');
+            throw new Error('Telegram management command response was not ok');
           }
           NODE
 

@@ -183,57 +183,71 @@ describe('manual deployment workflow', () => {
     expect(smoke).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)/m);
   });
 
-  it('performs a failing-fast management bot help command validation without logging secrets or tokens', () => {
-    const help = stepBody('Verify Management Help Command');
+  it('defines workflow_dispatch inputs for management_smoke_command with /help and /monitor_add', () => {
+    // Verify management_smoke_command input is defined under workflow_dispatch
+    expect(workflow).toMatch(/management_smoke_command:\s*\n/);
+    expect(workflow).toMatch(/type:\s*choice\s*\n/);
+    expect(workflow).toMatch(/default:\s*['"]?\/help['"]?\s*\n/);
+    expect(workflow).toMatch(/options:\s*\n\s+-\s+['"]?\/help['"]?\s*\n\s+-\s+['"]?\/monitor_add['"]?/);
+  });
+
+  it('performs a failing-fast management bot command validation without logging secrets or tokens', () => {
+    const commandStep = stepBody('Verify Management Command');
 
     // 1) Verify step exists
-    expect(help).toBeTruthy();
+    expect(commandStep).toBeTruthy();
 
-    // 2) Verify step order: Verify Management Telegram Delivery < Verify Management Help Command < Verify Push Telegram Delivery
+    // 2) Verify step order: Verify Management Telegram Delivery < Verify Management Command < Verify Push Telegram Delivery
     const mgmtPos = workflow.indexOf('- name: Verify Management Telegram Delivery');
-    const helpPos = workflow.indexOf('- name: Verify Management Help Command');
+    const cmdPos = workflow.indexOf('- name: Verify Management Command');
     const pushPos = workflow.indexOf('- name: Verify Push Telegram Delivery');
-    expect(mgmtPos).toBeLessThan(helpPos);
-    expect(helpPos).toBeLessThan(pushPos);
+    expect(mgmtPos).toBeLessThan(cmdPos);
+    expect(cmdPos).toBeLessThan(pushPos);
 
     // 3) Verify BASE_URL parsed from wrangler.toml with HTTPS and no trailing slash
-    expect(help).toContain("fs.readFileSync('wrangler.toml', 'utf8')");
-    expect(help).toContain('JSON.parse(match[1])');
-    expect(help).toContain("parsed.protocol !== 'https:'");
-    expect(help).toContain("parsed.href.replace(/\\/$/, '')");
+    expect(commandStep).toContain("fs.readFileSync('wrangler.toml', 'utf8')");
+    expect(commandStep).toContain('JSON.parse(match[1])');
+    expect(commandStep).toContain("parsed.protocol !== 'https:'");
+    expect(commandStep).toContain("parsed.href.replace(/\\/$/, '')");
 
     // 4) Verify webhook secret derivation using crypto.createHash(\"sha256\").update(process.env.ADMIN_TOKEN,\"utf8\").digest(\"hex\")
-    expect(help).toContain('crypto.createHash("sha256").update(process.env.ADMIN_TOKEN,"utf8").digest("hex")');
+    expect(commandStep).toContain('crypto.createHash("sha256").update(process.env.ADMIN_TOKEN,"utf8").digest("hex")');
 
     // 5) Verify webhook header X-Telegram-Bot-Api-Secret-Token
-    expect(help).toContain('X-Telegram-Bot-Api-Secret-Token');
+    expect(commandStep).toContain('X-Telegram-Bot-Api-Secret-Token');
 
     // 6) Verify variables TELEGRAM_CHAT_ID and TELEGRAM_ADMIN_USER_ID used in payload
-    expect(help).toContain('TELEGRAM_CHAT_ID');
-    expect(help).toContain('TELEGRAM_ADMIN_USER_ID');
-    expect(help).toMatch(/chat:\s*\{[^}]*type:\s*['"]private['"]/);
+    expect(commandStep).toContain('TELEGRAM_CHAT_ID');
+    expect(commandStep).toContain('TELEGRAM_ADMIN_USER_ID');
+    expect(commandStep).toMatch(/chat:\s*\{[^}]*type:\s*['"]private['"]/);
 
-    // 7) Verify /help command in text
-    expect(help).toContain('/help');
+    // 7) Verify MANAGEMENT_SMOKE_COMMAND env is read inside the script and not hardcoded to /help
+    expect(commandStep).toContain('process.env.MANAGEMENT_SMOKE_COMMAND');
+    expect(commandStep).not.toMatch(/text:\s*['"]\/help['"]/);
 
     // 8) Verify payload/response files created via mktemp and deleted with trap EXIT
-    expect(help).toContain('mktemp');
-    expect(help).toMatch(/trap\s+['"][^']*rm\s+-f\s+[^']*payload_file[^']*response_file[^']*['"]\s+EXIT/);
+    expect(commandStep).toContain('mktemp');
+    expect(commandStep).toMatch(/trap\s+['"][^']*rm\s+-f\s+[^']*payload_file[^']*response_file[^']*['"]\s+EXIT/);
 
     // 9) Verify curl fails fast, silent, show error, fail with body, data-binary, POST to BASE_URL/telegram
-    expect(help).toContain('curl');
-    expect(help).toContain('--silent');
-    expect(help).toContain('--show-error');
-    expect(help).toContain('--fail-with-body');
-    expect(help).toContain('--data-binary');
-    expect(help).toContain('/telegram');
+    expect(commandStep).toContain('curl');
+    expect(commandStep).toContain('--silent');
+    expect(commandStep).toContain('--show-error');
+    expect(commandStep).toContain('--fail-with-body');
+    expect(commandStep).toContain('--data-binary');
+    expect(commandStep).toContain('/telegram');
 
-    // 10) Verify HTTP response is ok, verify precise response validation
-    expect(help).toMatch(/['"]ok['"]/);
+    // 10) Verify HTTP response is ok, verify precise response validation and generic error description
+    expect(commandStep).toMatch(/['"]ok['"]/);
+    expect(commandStep).toContain('Telegram management command response was not ok');
+    expect(commandStep).not.toContain('Telegram /help command response was not ok');
 
     // 11) Verify no xtrace or secrets leaked via echo/printf/cat of secret files
-    expect(help).not.toMatch(/set\s+-(?:[^\n]*x|[^\n]*o\s+xtrace)|set\s+-x/);
-    expect(help).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:ADMIN_TOKEN|SECRET)/m);
-    expect(help).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+    expect(commandStep).not.toMatch(/set\s+-(?:[^\n]*x|[^\n]*o\s+xtrace)|set\s+-x/);
+    expect(commandStep).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:ADMIN_TOKEN|SECRET)/m);
+    expect(commandStep).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+
+    // 12) Verify step has safe default for environment variable
+    expect(commandStep).toMatch(/MANAGEMENT_SMOKE_COMMAND:\s*['"]?\$\{\{\s*(?:github\.event\.)?inputs\.management_smoke_command\s*\|\|\s*['"]\/help['"]\s*\}\}['"]?/);
   });
 });
