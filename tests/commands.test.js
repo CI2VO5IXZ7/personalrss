@@ -156,6 +156,30 @@ describe('Telegram Production Command Namespace', () => {
     return JSON.parse(calls[calls.length - 1][1].body).text;
   };
 
+  const sendCallbackQueryWebhook = async ({ data, chatId = '12345', fromId = 'admin1', chatType = 'private' }) => {
+    const payload = {
+      callback_query: {
+        id: 'cb_query_123',
+        from: { id: fromId },
+        message: {
+          chat: { id: chatId, type: chatType }
+        },
+        data
+      }
+    };
+    const req = new Request('https://worker.local/telegram', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': '930bbdc51b6aed5c2a5678fd6e28dee7a05e8a4b643cfc0b4427c3efb86c0d94'
+      },
+      body: JSON.stringify(payload)
+    });
+    const res = await app.fetch(req, env, ctx);
+    expect(res.status).toBe(200);
+    return ctx.waitUntil.mock.calls[ctx.waitUntil.mock.calls.length - 1]?.[0];
+  };
+
   it('creates an Instagram Generator with /gen_add, refreshes, and does not auto-push', async () => {
     const mockFetch = makeImageFetch();
     globalThis.fetch = mockFetch;
@@ -337,7 +361,7 @@ describe('Telegram Production Command Namespace', () => {
     const mockFetch = makeStockFetch('1720.50');
     globalThis.fetch = mockFetch;
 
-    await (await sendWebhook('/monitor_add'));
+    await (await sendWebhook('/monitor_add stock'));
     let session = await getBotSession(db, '12345');
     expect(session).not.toBeNull();
     expect(session.flow).toBe('monitor_add');
@@ -415,7 +439,7 @@ describe('Telegram Production Command Namespace', () => {
     const mockFetch = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ ok: true }) });
     globalThis.fetch = mockFetch;
 
-    await (await sendWebhook('/monitor_add'));
+    await (await sendWebhook('/monitor_add stock'));
     let session = await getBotSession(db, '12345');
     expect(session).not.toBeNull();
 
@@ -541,7 +565,7 @@ describe('Telegram Production Command Namespace', () => {
       globalThis.fetch = mockFetch;
 
       // Start session
-      await (await sendWebhook('/monitor_add'));
+      await (await sendWebhook('/monitor_add stock'));
       let session = await getBotSession(db, '12345');
       expect(session.step).toBe('await_code');
 
@@ -557,7 +581,7 @@ describe('Telegram Production Command Namespace', () => {
       expect(session).toBeNull();
 
       // Start session again
-      await (await sendWebhook('/monitor_add'));
+      await (await sendWebhook('/monitor_add stock'));
       session = await getBotSession(db, '12345');
       expect(session.step).toBe('await_code');
 
@@ -591,7 +615,7 @@ describe('Telegram Production Command Namespace', () => {
       globalThis.fetch = mockFetch;
 
       // Start session
-      await (await sendWebhook('/monitor_add'));
+      await (await sendWebhook('/monitor_add stock'));
       let session = await getBotSession(db, '12345');
       expect(session.step).toBe('await_code');
 
@@ -637,7 +661,7 @@ describe('Telegram Production Command Namespace', () => {
       globalThis.fetch = mockFetch;
 
       // Start an active monitor session
-      await (await sendWebhook('/monitor_add'));
+      await (await sendWebhook('/monitor_add stock'));
       let session = await getBotSession(db, '12345');
       expect(session).not.toBeNull();
       expect(session.step).toBe('await_code');
@@ -661,6 +685,330 @@ describe('Telegram Production Command Namespace', () => {
       // 3) Verify market quotes are never queried
       const quoteCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && (c[0].includes('sqt.gtimg.cn') || c[0].includes('sinajs.cn')));
       expect(quoteCalls).toHaveLength(0);
+    });
+
+
+    it('should start session flow=monitor_add step=await_type on /monitor_add without parameters, and show inline keyboard', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      await (await sendWebhook('/monitor_add'));
+
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.flow).toBe('monitor_add');
+      expect(session.step).toBe('await_type');
+
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      const body = JSON.parse(sendMsgCalls[0][1].body);
+      expect(body.text).toContain('请选择监控类别');
+      expect(body.reply_markup).toEqual({
+        inline_keyboard: [[{ text: '📈 股票', callback_data: 'monitor_add:type:stock' }]]
+      });
+    });
+
+    it('should directly start session flow=monitor_add step=await_code on /monitor_add stock', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      await (await sendWebhook('/monitor_add stock'));
+
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.flow).toBe('monitor_add');
+      expect(session.step).toBe('await_code');
+
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      const body = JSON.parse(sendMsgCalls[0][1].body);
+      expect(body.text).toContain('请输入股票代码');
+      expect(body.reply_markup).toBeUndefined();
+    });
+
+    it('should answer callback query and transition session on valid callback query click', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      // 1. Manually set session to await_type
+      await db.prepare("INSERT INTO bot_sessions (chat_id, flow, step, data_json, expires_at) VALUES ('12345', 'monitor_add', 'await_type', '{}', '2026-07-13T08:40:00Z')").run();
+
+      // 2. Click callback query button
+      const promise = await sendCallbackQueryWebhook({ data: 'monitor_add:type:stock' });
+      await promise;
+
+      // 3. Verify session changed to await_code
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_code');
+
+      // 4. Verify answerCallbackQuery was called
+      const answerCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('answerCallbackQuery'));
+      expect(answerCalls).toHaveLength(1);
+
+      // 5. Verify prompt was sent
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      const body = JSON.parse(sendMsgCalls[0][1].body);
+      expect(body.text).toContain('请输入股票代码');
+    });
+
+    it('should show warning and answer callback query on expired/invalid/no session callback query clicks', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      // 1. Click callback query with no session
+      const promise = await sendCallbackQueryWebhook({ data: 'monitor_add:type:stock' });
+      await promise;
+
+      // Verify no session was created/changed
+      let session = await getBotSession(db, '12345');
+      expect(session).toBeNull();
+
+      // Verify answerCallbackQuery called with safety prompt
+      const answerCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('answerCallbackQuery'));
+      expect(answerCalls).toHaveLength(1);
+      const answerBody = JSON.parse(answerCalls[0][1].body);
+      expect(answerBody.text).toContain('过期或无效');
+
+      // Verify no business messages sent
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(0);
+    });
+
+    it('should have no business side effects and not change session on unauthorized callback query clicks', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      // 1. Manually set session to await_type
+      await db.prepare("INSERT INTO bot_sessions (chat_id, flow, step, data_json, expires_at) VALUES ('12345', 'monitor_add', 'await_type', '{}', '2026-07-13T08:40:00Z')").run();
+
+      // 2. Click callback query with unauthorized chat
+      await sendCallbackQueryWebhook({ data: 'monitor_add:type:stock', chatId: '99999' });
+
+      // Verify session of the main chat has not changed
+      let session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_type');
+
+      // Verify no database session created for unauthorized chat
+      let badSession = await getBotSession(db, '99999');
+      expect(badSession).toBeNull();
+
+      // Verify no external quotes or message sends were triggered
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(0);
+    });
+
+    it('should handle text input in await_type session state', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      // 1. Set session to await_type
+      await db.prepare("INSERT INTO bot_sessions (chat_id, flow, step, data_json, expires_at) VALUES ('12345', 'monitor_add', 'await_type', '{}', '2026-07-13T08:40:00Z')").run();
+
+      // 2. Send random text
+      await sendWebhook('hello');
+      let session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_type'); // should stay in await_type
+      let sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      expect(JSON.parse(sendMsgCalls[0][1].body).text).toContain('选择监控类别');
+
+      mockFetch.mockClear();
+
+      // 3. Send "股票"
+      await sendWebhook('股票');
+      session = await getBotSession(db, '12345');
+      expect(session.step).toBe('await_code'); // should transition to await_code
+      sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      expect(JSON.parse(sendMsgCalls[0][1].body).text).toContain('请输入股票代码');
+    });
+  });
+
+  describe('Generic Provider Catalog Integration and Unit Tests', () => {
+    it('should save providerType=stock in session data_json on callback selection for stock', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      await db.prepare("INSERT INTO bot_sessions (chat_id, flow, step, data_json, expires_at) VALUES ('12345', 'monitor_add', 'await_type', '{}', '2026-07-13T08:40:00Z')").run();
+
+      const promise = await sendCallbackQueryWebhook({ data: 'monitor_add:type:stock' });
+      await promise;
+
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_code');
+      const sessionData = JSON.parse(session.data_json);
+      expect(sessionData.providerType).toBe('stock');
+    });
+
+    it('should not advance session on invalid callback query data', async () => {
+      const mockFetch = makeStockFetch('1720.50');
+      globalThis.fetch = mockFetch;
+
+      await db.prepare("INSERT INTO bot_sessions (chat_id, flow, step, data_json, expires_at) VALUES ('12345', 'monitor_add', 'await_type', '{}', '2026-07-13T08:40:00Z')").run();
+
+      // Invalid/unregistered callback query data
+      const promise = await sendCallbackQueryWebhook({ data: 'monitor_add:type:invalid' });
+      await promise;
+
+      // Session should remain in await_type
+      let session = await getBotSession(db, '12345');
+      expect(session).not.toBeNull();
+      expect(session.step).toBe('await_type');
+    });
+
+    it('should enforce default catalog rules: callback_data <= 64 chars, uniqueness, and text aliases uniqueness', async () => {
+      const { MONITOR_PROVIDERS_CATALOG } = await import('../src/monitors/catalog.js');
+      expect(MONITOR_PROVIDERS_CATALOG).toBeDefined();
+
+      const callbackDatas = [];
+      const aliases = [];
+
+      for (const provider of MONITOR_PROVIDERS_CATALOG) {
+        // callback_data length <= 64
+        expect(provider.callbackData.length).toBeLessThanOrEqual(64);
+
+        // Unique callbackData
+        expect(callbackDatas).not.toContain(provider.callbackData);
+        callbackDatas.push(provider.callbackData);
+
+        // Unique aliases
+        for (const alias of provider.aliases) {
+          expect(aliases).not.toContain(alias.toLowerCase());
+          aliases.push(alias.toLowerCase());
+        }
+      }
+    });
+
+    it('should verify that buttons displayed in keyboard come from catalog', async () => {
+      const { MONITOR_PROVIDERS_CATALOG } = await import('../src/monitors/catalog.js');
+      const mockFetch = makeStockFetch('100');
+      globalThis.fetch = mockFetch;
+
+      await (await sendWebhook('/monitor_add'));
+
+      const sendMsgCalls = mockFetch.mock.calls.filter(c => typeof c[0] === 'string' && c[0].includes('sendMessage'));
+      expect(sendMsgCalls).toHaveLength(1);
+      const body = JSON.parse(sendMsgCalls[0][1].body);
+      const inlineKeyboard = body.reply_markup.inline_keyboard;
+
+      // Flatten the buttons from the keyboard
+      const buttons = inlineKeyboard.flat();
+      expect(buttons.length).toBe(MONITOR_PROVIDERS_CATALOG.length);
+
+      for (const provider of MONITOR_PROVIDERS_CATALOG) {
+        const matchedButton = buttons.find(b => b.callback_data === provider.callbackData);
+        expect(matchedButton).toBeDefined();
+        expect(matchedButton.text).toBe(provider.text);
+      }
+    });
+
+    it('should verify catalog helper functions using a fake catalog', async () => {
+      const {
+        buildMonitorCategoryKeyboard,
+        getProviderByType,
+        getProviderByCallbackData,
+        getProviderByTextInput,
+        getProviderSelectionTransition
+      } = await import('../src/monitors/catalog.js');
+
+      const fakeCatalog = [
+        {
+          type: 'crypto',
+          text: '🪙 加密货币',
+          callbackData: 'monitor_add:type:crypto',
+          aliases: ['crypto', '加密货币'],
+          nextStep: 'await_crypto_code',
+          sessionData: { providerType: 'crypto' },
+          prompt: '请输入代币名称：\n(发送 /cancel 退出)'
+        },
+        {
+          type: 'nft',
+          text: '🎨 NFT',
+          callbackData: 'monitor_add:type:nft',
+          aliases: ['nft', '数字藏品'],
+          nextStep: 'await_nft_code',
+          sessionData: { providerType: 'nft' },
+          prompt: '请输入NFT ID：\n(发送 /cancel 退出)'
+        }
+      ];
+
+      // Test buildMonitorCategoryKeyboard with fakeCatalog
+      const keyboard = buildMonitorCategoryKeyboard(fakeCatalog);
+      expect(keyboard.inline_keyboard).toEqual([
+        [{ text: '🪙 加密货币', callback_data: 'monitor_add:type:crypto' }],
+        [{ text: '🎨 NFT', callback_data: 'monitor_add:type:nft' }]
+      ]);
+
+      // Test getProviderByType with fakeCatalog
+      const cryptoProvider = getProviderByType('crypto', fakeCatalog);
+      expect(cryptoProvider).toBe(fakeCatalog[0]);
+      const nftProvider = getProviderByType('nft', fakeCatalog);
+      expect(nftProvider).toBe(fakeCatalog[1]);
+      expect(getProviderByType('stock', fakeCatalog)).toBeUndefined();
+
+      // Test getProviderByCallbackData with fakeCatalog
+      expect(getProviderByCallbackData('monitor_add:type:crypto', fakeCatalog)).toBe(fakeCatalog[0]);
+      expect(getProviderByCallbackData('monitor_add:type:invalid', fakeCatalog)).toBeUndefined();
+
+      // Test getProviderByTextInput with fakeCatalog
+      expect(getProviderByTextInput('加密货币', fakeCatalog)).toBe(fakeCatalog[0]);
+      expect(getProviderByTextInput(' crypto ', fakeCatalog)).toBe(fakeCatalog[0]);
+      expect(getProviderByTextInput('数字藏品', fakeCatalog)).toBe(fakeCatalog[1]);
+      expect(getProviderByTextInput('invalid', fakeCatalog)).toBeUndefined();
+
+      // Test getProviderSelectionTransition
+      const transition = getProviderSelectionTransition(fakeCatalog[0]);
+      expect(transition).toEqual({
+        nextStep: 'await_crypto_code',
+        sessionData: { providerType: 'crypto' },
+        prompt: '请输入代币名称：\n(发送 /cancel 退出)'
+      });
+      expect(getProviderSelectionTransition(null)).toBeNull();
+
+      // Verify callback length on fake catalog
+      for (const provider of fakeCatalog) {
+        expect(provider.callbackData.length).toBeLessThanOrEqual(64);
+      }
+
+      // Verify uniqueness on fake catalog
+      const callbackDatas = fakeCatalog.map(p => p.callbackData);
+      const uniqueCallbackDatas = [...new Set(callbackDatas)];
+      expect(callbackDatas.length).toBe(uniqueCallbackDatas.length);
+
+      const aliases = fakeCatalog.flatMap(p => p.aliases.map(a => a.toLowerCase()));
+      const uniqueAliases = [...new Set(aliases)];
+      expect(aliases.length).toBe(uniqueAliases.length);
+    });
+
+    it('should verify that the default catalog and all nested objects are deep-frozen', async () => {
+      const { MONITOR_PROVIDERS_CATALOG } = await import('../src/monitors/catalog.js');
+      expect(Object.isFrozen(MONITOR_PROVIDERS_CATALOG)).toBe(true);
+
+      for (const provider of MONITOR_PROVIDERS_CATALOG) {
+        expect(Object.isFrozen(provider)).toBe(true);
+        expect(Object.isFrozen(provider.aliases)).toBe(true);
+        expect(Object.isFrozen(provider.sessionData)).toBe(true);
+
+        // Attempting to push or modify should throw or fail
+        expect(() => {
+          MONITOR_PROVIDERS_CATALOG.push({});
+        }).toThrow();
+
+        expect(() => {
+          provider.type = 'new_type';
+        }).toThrow();
+
+        expect(() => {
+          provider.aliases.push('new_alias');
+        }).toThrow();
+
+        expect(() => {
+          provider.sessionData.foo = 'bar';
+        }).toThrow();
+      }
     });
   });
 });

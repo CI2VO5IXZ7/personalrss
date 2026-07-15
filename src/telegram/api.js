@@ -8,5 +8,6 @@ export {
   setWebhook,
   verifyWebhookSecret,
   parseCommand,
-  escapeHtml
+  escapeHtml,
+  answerCallbackQuery
 } from '../telegram.js';

@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { deriveWebhookSecret, verifyWebhookSecret, sendMessage, parseCommand, setMyCommands, setWebhook } from './api.js';
+import { deriveWebhookSecret, verifyWebhookSecret, sendMessage, parseCommand, setMyCommands, setWebhook, answerCallbackQuery } from './api.js';
 import { handleCommand, isKnownCommand } from './commands.js';
 import { handleSessionMessage, cancelSession } from './sessions.js';
 import { getTelegramBotCommands, buildTelegramHelpMessage } from '../telegram_commands.js';
@@ -59,6 +59,78 @@ export function createTelegramRouter({ generatorService, monitorService, pushSer
       update = await c.req.json();
     } catch {
       return c.text('ok');
+    }
+
+    const callbackQuery = update.callback_query;
+    if (callbackQuery) {
+      const callbackQueryId = callbackQuery.id;
+      const msg = callbackQuery.message;
+      const chatId = msg?.chat?.id;
+      const fromUserId = callbackQuery.from?.id;
+      const chatType = msg?.chat?.type;
+      const callbackData = callbackQuery.data;
+      const token = c.env.TELEGRAM_BOT_TOKEN;
+      const allowedChat = c.env.TELEGRAM_CHAT_ID;
+      const adminUserId = c.env.TELEGRAM_ADMIN_USER_ID;
+
+      if (chatType !== 'private') {
+        logWarn('telegram.callback_chat_type_rejected', { chatType });
+        return c.text('ok');
+      }
+
+      if (String(chatId) !== String(allowedChat)) {
+        logWarn('telegram.callback_chat_rejected', { chatId });
+        return c.text('ok');
+      }
+
+      if (!adminUserId || String(fromUserId || '') !== String(adminUserId)) {
+        logWarn('telegram.callback_user_rejected', { fromUserId });
+        return c.text('ok');
+      }
+
+      const db = c.env.DB;
+      const session = await getBotSession(db, chatId);
+
+      const { getProviderByCallbackData, getProviderSelectionTransition } = await import('../monitors/catalog.js');
+      const provider = getProviderByCallbackData(callbackData);
+
+      if (session && session.flow === 'monitor_add' && session.step === 'await_type' && provider) {
+        c.executionCtx.waitUntil((async () => {
+          try {
+            await answerCallbackQuery(token, callbackQueryId);
+            const transition = getProviderSelectionTransition(provider);
+            const { startSession } = await import('./sessions.js');
+            await startSession(
+              db,
+              chatId,
+              'monitor_add',
+              transition.nextStep,
+              transition.sessionData,
+              token,
+              transition.prompt
+            );
+          } catch (err) {
+            logError('telegram.callback_transition_failed', {
+              error: redactText(err.message || String(err))
+            });
+          }
+        })());
+        return c.text('ok');
+      } else {
+        c.executionCtx.waitUntil((async () => {
+          try {
+            await answerCallbackQuery(token, callbackQueryId, {
+              text: '操作已过期或无效。',
+              show_alert: false
+            });
+          } catch (err) {
+            logError('telegram.callback_answer_failed', {
+              error: redactText(err.message || String(err))
+            });
+          }
+        })());
+        return c.text('ok');
+      }
     }
 
     const msg = update.message;

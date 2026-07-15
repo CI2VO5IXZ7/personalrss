@@ -57,17 +57,49 @@ export async function sendMessage(token, chatId, text, parseModeOrOptions = 'HTM
     opts = options || {};
   }
   const fetchFn = opts.fetchFn || fetch;
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: parseMode,
+    disable_web_page_preview: true
+  };
+  if (opts.reply_markup) {
+    payload.reply_markup = opts.reply_markup;
+  }
   const resp = await fetchFn(`${TG_API}${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: parseMode,
-      disable_web_page_preview: true
-    })
+    body: JSON.stringify(payload)
   });
   return parseTelegramResponse(resp, 'sendMessage');
+}
+
+export async function answerCallbackQuery(token, callbackQueryId, textOrOptions = '', options = {}) {
+  let text = '';
+  let showAlert = false;
+  let opts = {};
+  if (typeof textOrOptions === 'object' && textOrOptions !== null) {
+    opts = textOrOptions;
+    text = opts.text || '';
+    showAlert = opts.showAlert || opts.show_alert || false;
+  } else {
+    text = textOrOptions;
+    opts = options || {};
+    showAlert = opts.showAlert || opts.show_alert || false;
+  }
+  const fetchFn = opts.fetchFn || fetch;
+  const body = {
+    callback_query_id: callbackQueryId
+  };
+  if (text) body.text = text;
+  if (showAlert) body.show_alert = showAlert;
+
+  const resp = await fetchFn(`${TG_API}${token}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return parseTelegramResponse(resp, 'answerCallbackQuery');
 }
 
 export async function sendPhotoWithFallback(token, chatId, photoUrl, caption = '', options = {}) {

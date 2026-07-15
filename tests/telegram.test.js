@@ -3,7 +3,8 @@ import {
   TelegramError,
   deriveWebhookSecret,
   sendMessage,
-  sendPhotoWithFallback
+  sendPhotoWithFallback,
+  answerCallbackQuery
 } from '../src/telegram.js';
 
 const punctuationHeavyAdminToken = 'Adm!n:T0ken/with?punctuation&symbols=%23+[]{}';
@@ -211,5 +212,45 @@ describe('Telegram Push Helpers', () => {
     expect(logOutput).toContain('***');
     
     consoleWarnSpy.mockRestore();
+  });
+
+  it('should support sendMessage with reply_markup options', async () => {
+    const mockGlobalFetch = vi.fn().mockImplementation(async () => {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: 123 } })
+      };
+    });
+    globalThis.fetch = mockGlobalFetch;
+
+    const replyMarkup = {
+      inline_keyboard: [[{ text: '📈 股票', callback_data: 'monitor_add:type:stock' }]]
+    };
+    const res = await sendMessage('token123', 'chat123', 'Hello', 'HTML', { reply_markup: replyMarkup });
+    expect(res.ok).toBe(true);
+    expect(mockGlobalFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(mockGlobalFetch.mock.calls[0][1].body);
+    expect(body.reply_markup).toEqual(replyMarkup);
+  });
+
+  it('should call answerCallbackQuery successfully', async () => {
+    const mockGlobalFetch = vi.fn().mockImplementation(async () => {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ ok: true, result: {} })
+      };
+    });
+    globalThis.fetch = mockGlobalFetch;
+
+    const res = await answerCallbackQuery('token123', 'query123', 'Done', { showAlert: true });
+    expect(res.ok).toBe(true);
+    expect(mockGlobalFetch).toHaveBeenCalledTimes(1);
+    expect(mockGlobalFetch.mock.calls[0][0]).toContain('answerCallbackQuery');
+    const body = JSON.parse(mockGlobalFetch.mock.calls[0][1].body);
+    expect(body.callback_query_id).toBe('query123');
+    expect(body.text).toBe('Done');
+    expect(body.show_alert).toBe(true);
   });
 });

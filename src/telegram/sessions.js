@@ -2,6 +2,11 @@ import { getBotSession, setBotSession, clearBotSession } from '../db.js';
 import { sendMessage } from './api.js';
 import { escapeHtml } from '../html.js';
 import { redactText, redactUrl } from '../security/url.js';
+import {
+  getProviderByTextInput,
+  getProviderSelectionTransition,
+  buildMonitorCategoryKeyboard
+} from '../monitors/catalog.js';
 
 function buildBaseUrl(env, req) {
   const raw = env.BASE_URL || `https://${new URL(req.url).host}`;
@@ -13,10 +18,10 @@ export async function cancelSession(db, chatId, token) {
   await sendMessage(token, chatId, '✅ 已取消当前会话。');
 }
 
-export async function startSession(db, chatId, flow, step, data, token, prompt) {
+export async function startSession(db, chatId, flow, step, data, token, prompt, options = {}) {
   const expiresAt = new Date(Date.now() + 300 * 1000).toISOString();
   await setBotSession(db, chatId, flow, step, data, expiresAt);
-  await sendMessage(token, chatId, prompt);
+  await sendMessage(token, chatId, prompt, 'HTML', options);
 }
 
 export async function handleStockCodeInput(db, chatId, codeInput, token, monitorService) {
@@ -60,6 +65,31 @@ async function handleMonitorAddSession(session, text, {
 }) {
   const input = text.trim();
   const monitorService = services.monitor;
+
+  if (session.step === 'await_type') {
+    const provider = getProviderByTextInput(input);
+    if (provider) {
+      const transition = getProviderSelectionTransition(provider);
+      await startSession(
+        db,
+        chatId,
+        'monitor_add',
+        transition.nextStep,
+        transition.sessionData,
+        token,
+        transition.prompt
+      );
+    } else {
+      await sendMessage(
+        token,
+        chatId,
+        '⚠️ 请点击下方按钮选择监控类别：\n(发送 /cancel 退出)',
+        'HTML',
+        { reply_markup: buildMonitorCategoryKeyboard() }
+      );
+    }
+    return;
+  }
 
   if (session.step === 'await_code') {
     await handleStockCodeInput(db, chatId, input, token, monitorService);

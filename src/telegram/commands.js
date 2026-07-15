@@ -4,6 +4,7 @@ import { escapeHtml } from '../html.js';
 import { redactText } from '../security/url.js';
 import { clearBotSession } from '../db.js';
 import { startSession, handleStockCodeInput } from './sessions.js';
+import { buildMonitorCategoryKeyboard } from '../monitors/catalog.js';
 
 function parsePositiveInteger(value) {
   const str = String(value).trim();
@@ -314,8 +315,8 @@ export async function handleCommand({
           break;
         }
 
-        // Case 3: No args, or just 'stock': /monitor_add or /monitor_add stock
-        if (args.length === 0 || (args.length === 1 && args[0].toLowerCase() === 'stock')) {
+        // Case 3: One arg 'stock': /monitor_add stock
+        if (args.length === 1 && args[0].toLowerCase() === 'stock') {
           await startSession(
             db, chatId, 'monitor_add', 'await_code', {}, token,
             '请输入股票代码：\n(发送 /cancel 退出)'
@@ -323,7 +324,17 @@ export async function handleCommand({
           break;
         }
 
-        // Case 4: Other invalid formats
+        // Case 4: Zero args: /monitor_add
+        if (args.length === 0) {
+          await startSession(
+            db, chatId, 'monitor_add', 'await_type', {}, token,
+            '请选择监控类别：\n(发送 /cancel 退出)',
+            { reply_markup: buildMonitorCategoryKeyboard() }
+          );
+          break;
+        }
+
+        // Case 5: Other invalid formats (e.g. /monitor_add invalid_provider)
         await sendMessage(token, chatId, '❌ 用法：/monitor_add stock &lt;code&gt; &lt;gte|lte&gt; &lt;price&gt;');
         break;
       }
