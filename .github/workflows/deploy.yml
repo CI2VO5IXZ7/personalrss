@@ -239,6 +239,31 @@ jobs:
           process.stdout.write(`${JSON.stringify({ stage: 'getWebhookInfo', webhookHost: new URL(actual).host, webhookPath: new URL(actual).pathname })}\n`);
           NODE
 
+      - name: Verify Management Telegram Delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          curl --silent --show-error --fail-with-body \
+            --output "$response_file" \
+            --request POST \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=✅ PersonalRSS management bot deployment smoke test passed." \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+
+          TELEGRAM_RESPONSE_FILE="$response_file" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const payload = JSON.parse(fs.readFileSync(process.env.TELEGRAM_RESPONSE_FILE, 'utf8'));
+          if (payload.ok === true && payload.result?.message_id) {
+            // success
+          } else {
+            throw new Error('Management Telegram smoke test reported failure');
+          }
+          NODE
+
       - name: Verify Push Telegram Delivery
         shell: bash
         run: |

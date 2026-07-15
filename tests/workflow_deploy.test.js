@@ -145,4 +145,41 @@ describe('manual deployment workflow', () => {
     expect(smoke).toMatch(/payload\.ok[\s\S]*payload\.result\?\.message_id/);
     expect(smoke).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:PUSH_TELEGRAM_BOT_TOKEN|PUSH_TELEGRAM_CHANNEL_ID)/m);
   });
+
+  it('performs a failing-fast management bot delivery smoke test without logging secrets', () => {
+    const smoke = stepBody('Verify Management Telegram Delivery');
+
+    // 1) Verify step exists
+    expect(smoke).toBeTruthy();
+
+    // 2) Verify step order: Setup Telegram Webhook < Verify Management Telegram Delivery < Verify Push Telegram Delivery
+    const setupPos = workflow.indexOf('- name: Setup Telegram Webhook');
+    const mgmtPos = workflow.indexOf('- name: Verify Management Telegram Delivery');
+    const pushPos = workflow.indexOf('- name: Verify Push Telegram Delivery');
+    expect(setupPos).toBeLessThan(mgmtPos);
+    expect(mgmtPos).toBeLessThan(pushPos);
+
+    // 3) Verify token/chat variables used
+    expect(smoke).toContain('bot${TELEGRAM_BOT_TOKEN}/sendMessage');
+    expect(smoke).toContain('chat_id=${TELEGRAM_CHAT_ID}');
+
+    // 4) Verify message_id and ok verification in Node
+    expect(smoke).toMatch(/payload\.ok\s*===\s*true/);
+    expect(smoke).toMatch(/payload\.result\?\.message_id/);
+
+    // 5) Verify fail-fast / shell flags
+    expect(smoke).toContain('set -euo pipefail');
+    expect(smoke).toContain('--silent');
+    expect(smoke).toContain('--show-error');
+    expect(smoke).toContain('--fail-with-body');
+
+    // 6) Verify response file lifecycle and no cat
+    expect(smoke).toContain('response_file="$(mktemp)"');
+    expect(smoke).toMatch(/trap\s+['"][^'"]*rm\s+-f\s+["']\$response_file["'][^'"]*['"]\s+EXIT/);
+    expect(smoke).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+
+    // 7) Verify no xtrace and no secrets leaked via echo/printf
+    expect(smoke).not.toMatch(/set\s+-(?:[^\n]*x|[^\n]*o\s+xtrace)|set\s+-x/);
+    expect(smoke).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)/m);
+  });
 });
