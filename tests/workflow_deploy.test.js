@@ -182,4 +182,58 @@ describe('manual deployment workflow', () => {
     expect(smoke).not.toMatch(/set\s+-(?:[^\n]*x|[^\n]*o\s+xtrace)|set\s+-x/);
     expect(smoke).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)/m);
   });
+
+  it('performs a failing-fast management bot help command validation without logging secrets or tokens', () => {
+    const help = stepBody('Verify Management Help Command');
+
+    // 1) Verify step exists
+    expect(help).toBeTruthy();
+
+    // 2) Verify step order: Verify Management Telegram Delivery < Verify Management Help Command < Verify Push Telegram Delivery
+    const mgmtPos = workflow.indexOf('- name: Verify Management Telegram Delivery');
+    const helpPos = workflow.indexOf('- name: Verify Management Help Command');
+    const pushPos = workflow.indexOf('- name: Verify Push Telegram Delivery');
+    expect(mgmtPos).toBeLessThan(helpPos);
+    expect(helpPos).toBeLessThan(pushPos);
+
+    // 3) Verify BASE_URL parsed from wrangler.toml with HTTPS and no trailing slash
+    expect(help).toContain("fs.readFileSync('wrangler.toml', 'utf8')");
+    expect(help).toContain('JSON.parse(match[1])');
+    expect(help).toContain("parsed.protocol !== 'https:'");
+    expect(help).toContain("parsed.href.replace(/\\/$/, '')");
+
+    // 4) Verify webhook secret derivation using crypto.createHash(\"sha256\").update(process.env.ADMIN_TOKEN,\"utf8\").digest(\"hex\")
+    expect(help).toContain('crypto.createHash("sha256").update(process.env.ADMIN_TOKEN,"utf8").digest("hex")');
+
+    // 5) Verify webhook header X-Telegram-Bot-Api-Secret-Token
+    expect(help).toContain('X-Telegram-Bot-Api-Secret-Token');
+
+    // 6) Verify variables TELEGRAM_CHAT_ID and TELEGRAM_ADMIN_USER_ID used in payload
+    expect(help).toContain('TELEGRAM_CHAT_ID');
+    expect(help).toContain('TELEGRAM_ADMIN_USER_ID');
+    expect(help).toMatch(/chat:\s*\{[^}]*type:\s*['"]private['"]/);
+
+    // 7) Verify /help command in text
+    expect(help).toContain('/help');
+
+    // 8) Verify payload/response files created via mktemp and deleted with trap EXIT
+    expect(help).toContain('mktemp');
+    expect(help).toMatch(/trap\s+['"][^']*rm\s+-f\s+[^']*payload_file[^']*response_file[^']*['"]\s+EXIT/);
+
+    // 9) Verify curl fails fast, silent, show error, fail with body, data-binary, POST to BASE_URL/telegram
+    expect(help).toContain('curl');
+    expect(help).toContain('--silent');
+    expect(help).toContain('--show-error');
+    expect(help).toContain('--fail-with-body');
+    expect(help).toContain('--data-binary');
+    expect(help).toContain('/telegram');
+
+    // 10) Verify HTTP response is ok, verify precise response validation
+    expect(help).toMatch(/['"]ok['"]/);
+
+    // 11) Verify no xtrace or secrets leaked via echo/printf/cat of secret files
+    expect(help).not.toMatch(/set\s+-(?:[^\n]*x|[^\n]*o\s+xtrace)|set\s+-x/);
+    expect(help).not.toMatch(/^\s*(?:echo|printf|tee|logger)\b[^\n]*(?:ADMIN_TOKEN|SECRET)/m);
+    expect(help).not.toMatch(/(?:cat|less|more)\s+[^\n]*response_file/);
+  });
 });

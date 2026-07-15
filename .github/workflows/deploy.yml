@@ -264,6 +264,65 @@ jobs:
           }
           NODE
 
+      - name: Verify Management Help Command
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_URL="$(
+            node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const toml = fs.readFileSync('wrangler.toml', 'utf8');
+          const match = toml.match(/^BASE_URL\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/m);
+          if (!match) throw new Error('BASE_URL is missing or is not a quoted TOML string');
+          const baseUrl = JSON.parse(match[1]);
+          const parsed = new URL(baseUrl);
+          if (parsed.protocol !== 'https:') throw new Error('BASE_URL must use HTTPS');
+          process.stdout.write(parsed.href.replace(/\/$/, ''));
+          NODE
+          )"
+
+          SECRET="$(
+            node --input-type=module <<'NODE'
+          import crypto from 'node:crypto';
+          const secret = crypto.createHash("sha256").update(process.env.ADMIN_TOKEN,"utf8").digest("hex");
+          process.stdout.write(secret);
+          NODE
+          )"
+
+          payload_file="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "$payload_file" "$response_file"' EXIT
+
+          PAYLOAD_FILE="$payload_file" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const payload = {
+            message: {
+              chat: { id: Number(process.env.TELEGRAM_CHAT_ID), type: "private" },
+              from: { id: Number(process.env.TELEGRAM_ADMIN_USER_ID) },
+              text: '/help'
+            }
+          };
+          fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+          NODE
+
+          curl --silent --show-error --fail-with-body \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --header "X-Telegram-Bot-Api-Secret-Token: ${SECRET}" \
+            --data-binary "@$payload_file" \
+            --output "$response_file" \
+            "${BASE_URL}/telegram"
+
+          RESPONSE_FILE="$response_file" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const response = fs.readFileSync(process.env.RESPONSE_FILE, 'utf8');
+          if (response !== 'ok') {
+            throw new Error('Telegram /help command response was not ok');
+          }
+          NODE
+
       - name: Verify Push Telegram Delivery
         shell: bash
         run: |
