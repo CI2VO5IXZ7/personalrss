@@ -12,7 +12,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.10.0",
     "hono": "^4.12.30"
   },
   "devDependencies": {
