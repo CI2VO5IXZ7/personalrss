@@ -2,6 +2,7 @@
 
 import { validateGeneratorProvider, GENERATOR_PROVIDER_TYPE_PATTERN } from './core/contract.js';
 import { instagramProvider } from './providers/instagram/index.js';
+import { stockProvider } from './providers/stock/index.js';
 
 function normalizeType(type) {
   if (typeof type !== 'string') {
@@ -61,6 +62,6 @@ export class GeneratorRegistry {
   }
 }
 
-export function createGeneratorRegistry(providers = [instagramProvider]) {
+export function createGeneratorRegistry(providers = [instagramProvider, stockProvider]) {
   return new GeneratorRegistry(providers);
 }

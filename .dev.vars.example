@@ -2,11 +2,5 @@
 # Copy to .dev.vars before running `npm run dev`
 
 BASE_URL=http://127.0.0.1:8787
-CACHE_TTL_MINUTES=60
 CACHE_MAX_POSTS=100
 REFRESH_CONCURRENCY=3
-FAILURE_ALERT_THRESHOLD=3
-
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_telegram_chat_id
-ADMIN_TOKEN=your_random_admin_token

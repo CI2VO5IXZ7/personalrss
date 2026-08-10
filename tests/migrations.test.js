@@ -341,3 +341,65 @@ describe('Cleanup legacy tables migration (0008)', () => {
     expect(tables).not.toContain('api_usage');
   });
 });
+
+describe('Remove push, bot, and monitor tables migrations (0009-0011)', () => {
+  const allMigrations = [
+    '0001_init.sql',
+    '0002_fix_unique_constraint.sql',
+    '0003_api_usage.sql',
+    '0004_post_meta_and_crawl_status.sql',
+    '0005_personal_info_hub.sql',
+    '0006_rss_secondary_dedupe_indexes.sql',
+    '0007_integrated_output_platform.sql',
+    '0008_drop_legacy_instagram_tables.sql',
+    '0009_remove_push.sql',
+    '0010_remove_bot.sql',
+    '0011_remove_monitor.sql'
+  ];
+
+  it('applies all migrations to a fresh database and drops push/bot/monitor tables', () => {
+    const db = new DatabaseSync(':memory:');
+    applyMigrations(db, allMigrations);
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+    expect(tables).not.toContain('rss_subscriptions');
+    expect(tables).not.toContain('rss_entries');
+    expect(tables).not.toContain('notification_queue');
+    expect(tables).not.toContain('bot_sessions');
+    expect(tables).not.toContain('tracker_rules');
+    expect(tables).not.toContain('tracker_events');
+
+    // Generator tables survive
+    expect(tables).toContain('generator_instances');
+    expect(tables).toContain('generator_items');
+    expect(tables).toContain('generator_status');
+  });
+
+  it('drops tables with existing data and is safe to reapply', () => {
+    const db = new DatabaseSync(':memory:');
+    applyMigrations(db, allMigrations.slice(0, 8)); // Up to 0008
+
+    db.exec(`
+      INSERT INTO rss_subscriptions (feed_url, feed_url_redacted) VALUES ('https://rss.com/feed', 'feed');
+      INSERT INTO rss_entries (subscription_id, entry_key) VALUES (1, 'key1');
+      INSERT INTO notification_queue (kind, dedupe_key, payload_json, status) VALUES ('rss', 'k', '{}', 'pending');
+      INSERT INTO bot_sessions (chat_id, flow, step, data_json) VALUES ('12345', 'setup', 'step1', '{}');
+      INSERT INTO tracker_rules (provider_type, target_key, target_config_json, condition_type, condition_value, status, arm_version)
+      VALUES ('stock', 'sh600519', '{}', 'gte', 1700.0, 'active', 1);
+      INSERT INTO tracker_events (rule_id, event_type, value) VALUES (1, 'price', 1700.0);
+    `);
+
+    applyMigrations(db, allMigrations.slice(8));
+
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+    expect(tables).not.toContain('rss_subscriptions');
+    expect(tables).not.toContain('rss_entries');
+    expect(tables).not.toContain('notification_queue');
+    expect(tables).not.toContain('bot_sessions');
+    expect(tables).not.toContain('tracker_rules');
+    expect(tables).not.toContain('tracker_events');
+
+    // Reapplying is idempotent
+    expect(() => applyMigrations(db, allMigrations.slice(8))).not.toThrow();
+  });
+});

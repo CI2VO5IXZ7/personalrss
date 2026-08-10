@@ -1,4 +1,13 @@
-import { normalizeMonitorEvent } from '../../core/contract.js';
+// Stock Generator Provider
+//
+// 该 provider 将新浪/腾讯 A 股行情接口的实时报价转换为 generator 标准化 item。
+//
+// 抓取策略：优先腾讯行情接口，缺失/过期/无效的 symbol 回退新浪接口。
+// 仅在交易时段（Asia/Shanghai 周一至周五 09:30-11:30、13:00-15:00）抓取；
+// 非交易时段返回 { items: [], meta: { reason: 'market_closed' } }。
+
+import { normalizeGeneratorItem } from '../../core/contract.js';
+import { escapeHtml } from '../../../html.js';
 
 export function normalizeSymbol(symbol) {
   if (!symbol) return null;
@@ -168,6 +177,7 @@ export function parseTencentQuote(text) {
     const fields = val.split('~');
     if (fields.length < 31) continue;
 
+    const name = fields[1];
     const code = fields[2];
     const latestPrice = parseFloat(fields[3]);
     const yesterdayClose = parseFloat(fields[4]);
@@ -193,6 +203,7 @@ export function parseTencentQuote(text) {
 
     quotes[key] = {
       symbol: key,
+      name: name || '',
       latestPrice,
       yesterdayClose,
       timestamp,
@@ -220,6 +231,7 @@ export function parseSinaQuote(bytes) {
       continue;
     }
 
+    const name = fields[0];
     const latestPrice = parseFloat(fields[3]);
     const yesterdayClose = parseFloat(fields[2]);
     const date = fields[30];
@@ -232,6 +244,7 @@ export function parseSinaQuote(bytes) {
     const timestamp = `${date}T${time}+08:00`;
     quotes[key] = {
       symbol: key,
+      name: name || '',
       latestPrice,
       yesterdayClose,
       timestamp,
@@ -317,113 +330,147 @@ export async function fetchStockQuotes(symbols, options = {}) {
   // 4. Merge results
   const finalQuotes = { ...validatedTencent, ...validatedSina };
 
-  // 5. Identify missing symbols after both attempts
-  const missingSymbols = normalized.filter(sym => !finalQuotes[sym]);
-
-  // 6. Only throw if no requested symbols are available
+  // 5. Only throw if no requested symbols are available
   if (Object.keys(finalQuotes).length === 0) {
     throw new Error('All stock quote providers failed');
   }
 
-  // Expose missing symbols to engine
-  Object.defineProperty(finalQuotes, 'missingSymbols', {
-    value: missingSymbols,
-    enumerable: false,
-    writable: true,
-    configurable: true
-  });
-
   return finalQuotes;
 }
 
-function evaluateCondition(rule, value) {
-  const price = typeof value === 'number' ? value : (value?.value ?? value?.latestPrice);
-  if (price === undefined || price === null || isNaN(price)) {
-    return false;
+function isPlainObject(value) {
+  return Object.prototype.toString.call(value) === '[object Object]';
+}
+
+function getCrypto(context) {
+  return context?.crypto || globalThis.crypto;
+}
+
+async function computeContentHash({ title, descriptionHtml }, context) {
+  const crypto = getCrypto(context);
+  if (!crypto || typeof crypto.subtle?.digest !== 'function') {
+    throw new Error('WebCrypto SHA-256 is not available');
   }
 
-  const conditionType = rule.conditionType ?? rule.condition_type;
-  const conditionValue = rule.conditionValue ?? rule.condition_value;
-
-  if (conditionType === 'gte') {
-    return price >= conditionValue;
-  } else if (conditionType === 'lte') {
-    return price <= conditionValue;
+  const payload = JSON.stringify({ title, descriptionHtml });
+  const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+  const bytes = new Uint8Array(buffer);
+  let hex = '';
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, '0');
   }
+  return hex;
+}
 
-  return false;
+function sinaStockUrl(symbol) {
+  return `https://finance.sina.com.cn/realstock/company/${symbol}/nc.shtml`;
+}
+
+function formatSignedNumber(value, digits = 2) {
+  const formatted = value.toFixed(digits);
+  return value > 0 ? `+${formatted}` : formatted;
+}
+
+function buildQuoteDescriptionHtml(quote, name) {
+  const change = quote.latestPrice - quote.yesterdayClose;
+  const changePct = (change / quote.yesterdayClose) * 100;
+
+  const rows = [
+    ['名称', name],
+    ['代码', quote.symbol],
+    ['最新价', quote.latestPrice.toFixed(2)],
+    ['昨收', quote.yesterdayClose.toFixed(2)],
+    ['涨跌', formatSignedNumber(change)],
+    ['涨跌幅', `${formatSignedNumber(changePct)}%`],
+    ['时间', quote.timestamp],
+    ['来源', quote.source]
+  ];
+
+  const body = rows
+    .map(([label, value]) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(String(value))}</td></tr>`)
+    .join('');
+  return `<table>${body}</table>`;
 }
 
 export const stockProvider = {
   type: 'stock',
-  displayName: 'A 股',
+  displayName: 'A股行情',
 
-  validateTarget(config, context) {
-    if (!config || typeof config !== 'object') return false;
-    const code = config.code;
-    return !!normalizeSymbol(code);
-  },
-
-  async fetchValues(targets, context = {}) {
-    const symbols = targets.map(t => normalizeSymbol(t.code)).filter(Boolean);
-    if (symbols.length === 0) return {};
-
-    const quotes = await fetchStockQuotes(symbols, {
-      fetchFn: context.fetchFn,
-      relativeTo: context.relativeTo
-    });
-
-    const result = {};
-    for (const sym of symbols) {
-      if (quotes[sym]) {
-        result[sym] = {
-          value: quotes[sym].latestPrice,
-          observedAt: quotes[sym].timestamp,
-          source: quotes[sym].source,
-          yesterdayClose: quotes[sym].yesterdayClose
-        };
-      }
+  validateConfig(config, context) {
+    if (config !== undefined && !isPlainObject(config)) {
+      throw new Error('Invalid config: must be a plain object or undefined');
     }
-    return result;
+
+    const code = normalizeSymbol(context?.instanceKey);
+    if (!code) {
+      throw new Error('Invalid stock code');
+    }
+
+    return { ...(config || {}), code, configVersion: 1 };
   },
 
-  evaluate(rule, value, context) {
-    return evaluateCondition(rule, value);
+  async fetchItems(instance, context = {}) {
+    if (!instance || typeof instance !== 'object' || Array.isArray(instance)) {
+      throw new Error('Invalid instance');
+    }
+
+    const symbol = normalizeSymbol(instance.config?.code || instance.instanceKey);
+    if (!symbol) {
+      throw new Error('Invalid stock code');
+    }
+
+    const now = context.now ? new Date(context.now) : new Date();
+    if (!isTradingSession(now)) {
+      return { items: [], meta: { reason: 'market_closed' } };
+    }
+
+    const quotes = await fetchStockQuotes([symbol], {
+      fetchFn: context.fetch || context.fetchFn,
+      relativeTo: now
+    });
+
+    const quote = quotes[symbol];
+    if (!quote) {
+      return { items: [], meta: { reason: 'no_quote' } };
+    }
+
+    return { items: [quote], meta: {} };
   },
 
-  formatEvent(rule, value, context) {
-    const price = typeof value === 'number' ? value : (value?.value ?? value?.latestPrice);
-    const observedAt = value?.observedAt ?? value?.timestamp ?? new Date().toISOString();
-    const source = value?.source ?? '';
-    const ruleId = rule.id ?? rule.ruleId;
-    const armVersion = rule.armVersion ?? rule.arm_version ?? 1;
-    const targetKey = rule.targetKey ?? rule.target_key;
-    const conditionType = rule.conditionType ?? rule.condition_type;
-    const conditionValue = rule.conditionValue ?? rule.condition_value;
-    const eventKey = `stock:rule:${ruleId}:${armVersion}`;
+  async normalizeItem(raw, instance, context) {
+    const quote = raw;
+    const symbol = normalizeSymbol(quote?.symbol || instance?.config?.code || instance?.instanceKey);
+    if (!symbol) {
+      throw new Error('Invalid stock quote: missing symbol');
+    }
 
-    return normalizeMonitorEvent({
-      providerType: 'stock',
-      ruleId,
-      armVersion,
-      eventKey,
-      occurredAt: observedAt,
-      value: price,
-      source,
-      payload: {
-        ruleId,
-        armVersion,
-        code: targetKey,
-        conditionType,
-        conditionValue,
-        price,
-        observedAt,
-        source
-      }
+    const name = quote.name || instance?.displayName || symbol;
+    const title = `${name} ${quote.latestPrice}`;
+    const descriptionHtml = buildQuoteDescriptionHtml(quote, name);
+    const contentHash = await computeContentHash({ title, descriptionHtml }, context);
+
+    return normalizeGeneratorItem({
+      itemKey: symbol,
+      canonicalId: symbol,
+      contentHash,
+      title,
+      descriptionHtml,
+      link: sinaStockUrl(symbol),
+      publishedAt: new Date(),
+      mediaType: '',
+      rawImages: []
     });
   },
 
-  normalizeValue(raw) {
-    return parseFloat(raw);
+  buildFeedMeta(instance, context) {
+    const symbol = normalizeSymbol(instance?.config?.code || instance?.instanceKey) || '';
+    const name = String(instance?.displayName || '').trim() || symbol;
+
+    return {
+      title: `${name}(A股)`,
+      link: symbol ? sinaStockUrl(symbol) : '',
+      description: 'A股行情',
+      language: 'zh-CN'
+    };
   }
 };

@@ -24,8 +24,7 @@ set -a
 source <(grep -v '^\s*#' .env | grep -v '^\s*$')
 set +a
 
-# 校验必要变量
-REQUIRED_VARS="TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_ADMIN_USER_ID ADMIN_TOKEN DEEPSEEK_API_KEY PUSH_TELEGRAM_BOT_TOKEN PUSH_TELEGRAM_CHANNEL_ID"
+REQUIRED_VARS="ADMIN_TOKEN"
 MISSING=""
 for var in $REQUIRED_VARS; do
   if [ -z "${!var:-}" ]; then
@@ -92,19 +91,17 @@ upsert_wrangler_var() {
 # ─── 2. 安装依赖 ───────────────────────────────────────────────────────────────
 
 echo ""
-echo "[1/6] 安装 npm 依赖..."
+echo "[1/4] 安装 npm 依赖..."
 npm install --silent 2>&1 | tail -1
 
-echo "[1.5/6] 同步 Worker 配置变量..."
-upsert_wrangler_var "CACHE_TTL_MINUTES" "${CACHE_TTL_MINUTES:-60}"
+echo "[1.5/4] 同步 Worker 配置变量..."
 upsert_wrangler_var "CACHE_MAX_POSTS" "${CACHE_MAX_POSTS:-100}"
 upsert_wrangler_var "REFRESH_CONCURRENCY" "${REFRESH_CONCURRENCY:-3}"
-upsert_wrangler_var "FAILURE_ALERT_THRESHOLD" "${FAILURE_ALERT_THRESHOLD:-3}"
 echo "  ✅ 已同步 wrangler.toml [vars]"
 
 # ─── 3. 创建 D1 数据库 ────────────────────────────────────────────────────────
 
-echo "[2/6] 检查 D1 数据库..."
+echo "[2/4] 检查 D1 数据库..."
 
 D1_DB_NAME="social-rss-bridge-db"
 
@@ -162,13 +159,13 @@ fi
 
 # ─── 4. 执行 D1 Migration ─────────────────────────────────────────────────────
 
-echo "[3/6] 执行数据库迁移..."
+echo "[3/4] 执行数据库迁移..."
 npx wrangler d1 migrations apply "$D1_DB_NAME" --remote 2>&1 | tail -3
 echo "  ✅ 数据库迁移完成"
 
 # ─── 5. 部署 Worker ────────────────────────────────────────────────────────────
 
-echo "[4/6] 部署 Worker..."
+echo "[4/4] 部署 Worker..."
 DEPLOY_OUTPUT=$(npx wrangler deploy 2>&1) || {
   echo "❌ 部署失败："
   echo "$DEPLOY_OUTPUT"
@@ -181,50 +178,11 @@ WORKER_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'https://[a-zA-Z0-9._-]+\.workers\
 if [ -n "$WORKER_URL" ]; then
   echo "  🌐 Worker URL: $WORKER_URL"
   sed -i "s|BASE_URL = \".*\"|BASE_URL = \"$WORKER_URL\"|" wrangler.toml
-fi
 
-# ─── 6. 设置 Secrets ──────────────────────────────────────────────────────────
-
-echo "[5/6] 设置 Secrets..."
-
-set_secret() {
-  local NAME=$1
-  local VALUE=$2
-  if [ -n "$VALUE" ]; then
-    echo "$VALUE" | npx wrangler secret put "$NAME" --name social-rss-bridge 2>&1 | tail -1
-    echo "  ✅ $NAME"
-  fi
-}
-
-set_secret "TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN"
-set_secret "TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID"
-set_secret "ADMIN_TOKEN" "$ADMIN_TOKEN"
-set_secret "DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY"
-set_secret "PUSH_TELEGRAM_BOT_TOKEN" "$PUSH_TELEGRAM_BOT_TOKEN"
-set_secret "PUSH_TELEGRAM_CHANNEL_ID" "$PUSH_TELEGRAM_CHANNEL_ID"
-set_secret "TELEGRAM_ADMIN_USER_ID" "$TELEGRAM_ADMIN_USER_ID"
-
-# 如果 BASE_URL 更新了，重新部署一次
-if [ -n "$WORKER_URL" ]; then
+  # 重新部署一次以应用 BASE_URL
   echo ""
   echo "  重新部署以应用 BASE_URL..."
   npx wrangler deploy 2>&1 | tail -2
-fi
-
-# ─── 7. 设置 Telegram Webhook ─────────────────────────────────────────────────
-
-echo "[6/6] 设置 Telegram Webhook..."
-if [ -n "$WORKER_URL" ]; then
-  WEBHOOK_RESP=$(curl -sf -X POST "$WORKER_URL/setup-webhook" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>&1) || true
-  if echo "$WEBHOOK_RESP" | grep -q '"ok":true'; then
-    echo "  ✅ Telegram Webhook 设置成功"
-  else
-    echo "  ⚠️  Webhook 设置可能需要等待 Worker 生效后重试："
-    echo "     curl -X POST \"$WORKER_URL/setup-webhook\" -H \"Authorization: Bearer <ADMIN_TOKEN>\""
-  fi
-else
-  echo "  ⚠️  无法获取 Worker URL，请手动设置 Webhook"
 fi
 
 # ─── 完成 ──────────────────────────────────────────────────────────────────────
@@ -236,11 +194,5 @@ echo "╚═══════════════════════�
 echo ""
 if [ -n "$WORKER_URL" ]; then
   echo "🌐 服务地址: $WORKER_URL"
-  echo ""
-  echo "🤖 Telegram Bot 命令:"
-  echo "   /gen_add instagram <username> [displayName]  — 添加 Instagram Generator"
-  echo "   /monitor_add stock <code> <gte|lte> <price>  — 添加股票监控"
-  echo "   /push_add rss <url>                           — 添加 RSS 订阅推送"
-  echo "   /status                                       — 查看服务状态"
-  echo "   /help                                         — 显示帮助"
+  echo "📄 公开 RSS 路径: $WORKER_URL/feeds/<id>.xml"
 fi
