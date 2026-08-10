@@ -165,7 +165,11 @@ echo "  ✅ 数据库迁移完成"
 
 # ─── 5. 部署 Worker ────────────────────────────────────────────────────────────
 
-echo "[4/4] 部署 Worker..."
+echo "[3.5/5] 设置 ADMIN_TOKEN Secret..."
+echo "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN --name social-rss-bridge 2>&1 | tail -1
+echo "  ✅ ADMIN_TOKEN"
+
+echo "[4/5] 部署 Worker..."
 DEPLOY_OUTPUT=$(npx wrangler deploy 2>&1) || {
   echo "❌ 部署失败："
   echo "$DEPLOY_OUTPUT"
